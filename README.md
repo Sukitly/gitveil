@@ -53,20 +53,22 @@ Source development and tests may explicitly override the private sidecars with `
 
 ## Initial setup
 
-Generate a private identity explicitly after installation. The command selects `SOPS_AGE_KEY_FILE` when set, then the standard SOPS identity location for the current platform, creates private directories at mode `0700`, writes the identity at mode `0600`, and never replaces an existing path:
+Generate a private identity explicitly after installation. The command selects `SOPS_AGE_KEY_FILE` when set, then the standard SOPS identity file for the current platform, creates every missing identity directory at mode `0700`, writes the identity at mode `0600`, and never replaces an existing path:
 
 ```bash
 gitveil identity generate
 recipient="$(gitveil identity recipients)"
 ```
 
-If a matching identity already exists, skip `generate` and use `gitveil identity recipients` to derive its public value. To use a custom location, select it consistently for generation and subsequent commands:
+If a native age identity file already exists at the selected location, skip `generate` and use `gitveil identity recipients` to derive its public value. Both commands select one file using an explicit command option, then `SOPS_AGE_KEY_FILE`, then the platform default key file. `recipients` does not inspect `SOPS_AGE_KEY`, execute `SOPS_AGE_KEY_CMD`, or enumerate every identity source that SOPS may load. To use a custom location, select it consistently for generation and subsequent commands:
 
 ```bash
 export SOPS_AGE_KEY_FILE="$HOME/.config/sops/age/keys.txt"
 gitveil identity generate
 recipient="$(gitveil identity recipients)"
 ```
+
+After the identity has been atomically published, a directory-sync failure is reported as a warning rather than a generation failure: the command still prints the published path and recipient and exits successfully, but durability across an immediate system crash was not confirmed. Preserve the identity file; `gitveil identity recipients --identity <path>` can print its recipient again.
 
 `init` and `add` must run at a Git repository root containing a `.git` file or directory. `init` accepts only public `age1...` recipients, never private identities:
 
@@ -179,7 +181,8 @@ Gitveil reads index stages but never runs `git add`.
 - Gitveil enforces SOPS `encrypted_regex: .*`; every source scalar and layout/comment value is encrypted.
 - Each ciphertext file uses one data key. Removing a recipient causes `seal` and `resolve` to rotate that key, preventing the removed identity from decrypting later versions. Access to historical versions cannot be revoked; forward exclusion also requires rotating the actual secret values.
 - Paths undergo workspace-relative validation and descriptor-relative confinement; symlink and submodule escapes are rejected.
-- SOPS subprocesses have deadlines, and temporary files and IPC endpoints live in owner-only runtime directories.
+- SOPS and age-keygen subprocesses have deadlines. Unknown sidecar stderr is redacted and converted into fixed, typed diagnostics rather than being forwarded verbatim.
+- Temporary files and IPC endpoints live in owner-only runtime directories.
 - Gitveil writes no Git-internal state outside `.git/gitveil/` and never modifies the index, configuration, hooks, or attributes. Only root-level `init` and `add` write repository configuration; `add` owns and verifies the managed `.gitignore` block.
 
 ## Development

@@ -14,9 +14,7 @@ import tempfile
 
 from age_artifacts import VERSION as AGE_VERSION
 from age_artifacts import artifact_for as age_artifact_for
-from age_artifacts import fetch_archive as fetch_age_archive
 from age_artifacts import fetch_verified as fetch_age_keygen
-from age_artifacts import verify_archive as verify_age_archive
 from age_artifacts import verify_binary as verify_age_keygen
 from sops_artifacts import VERSION as SOPS_VERSION
 from sops_artifacts import artifact_for, fetch_verified, verify
@@ -145,6 +143,7 @@ def build_archive(
     binary: Path,
     sops_binary: Path | None,
     age_keygen_binary: Path | None,
+    age_keygen_archive: Path | None,
 ) -> Path:
     artifact = artifact_for()
     if not binary.is_file():
@@ -160,23 +159,17 @@ def build_archive(
     age_artifact = age_artifact_for()
     age_tools = root / "target" / "release-tools" / f"age-{AGE_VERSION}"
     if age_keygen_binary is None:
+        if age_keygen_archive is not None:
+            raise RuntimeError(
+                "--age-keygen-bin is required with --age-keygen-archive"
+            )
         age_keygen_binary = fetch_age_keygen(age_tools / "age-keygen", age_artifact)
     else:
-        test_archive = (
-            root
-            / "target"
-            / "test-tools"
-            / f"age-{AGE_VERSION}"
-            / age_artifact.filename
-        )
-        if test_archive.is_file():
-            verify_age_archive(test_archive, age_artifact)
-            age_archive = test_archive
-        else:
-            age_archive = fetch_age_archive(
-                age_tools / age_artifact.filename, age_artifact
+        if age_keygen_archive is None:
+            raise RuntimeError(
+                "--age-keygen-archive is required with --age-keygen-bin"
             )
-        verify_age_keygen(age_keygen_binary, age_archive)
+        verify_age_keygen(age_keygen_binary, age_keygen_archive, age_artifact)
 
     archive_root = archive_root_name(root)
     with tempfile.TemporaryDirectory(prefix="gitveil-package-") as temporary:

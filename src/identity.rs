@@ -1,6 +1,6 @@
 use std::fs::{self, File};
-use std::io::{Seek, SeekFrom, Write};
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::io::{self, Seek, SeekFrom, Write};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use rustix::fs::{Mode, OFlags, RenameFlags, open, renameat_with};
@@ -12,6 +12,13 @@ use crate::recipient::AgeRecipient;
 pub(crate) struct GeneratedIdentity {
     path: PathBuf,
     recipient: AgeRecipient,
+    durability: PublishDurability,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PublishDurability {
+    Confirmed,
+    Unconfirmed(io::ErrorKind),
 }
 
 impl GeneratedIdentity {
@@ -22,6 +29,10 @@ impl GeneratedIdentity {
     pub(crate) fn recipient(&self) -> &AgeRecipient {
         &self.recipient
     }
+
+    pub(crate) const fn durability(&self) -> PublishDurability {
+        self.durability
+    }
 }
 
 pub(crate) fn generate(
@@ -29,7 +40,7 @@ pub(crate) fn generate(
     gitveil_binary: &Path,
     requested: Option<&Path>,
 ) -> Result<GeneratedIdentity> {
-    let destination = resolve_identity_path(current, requested)?;
+    let destination = resolve_generation_destination(current, requested)?;
     match fs::symlink_metadata(&destination) {
         Ok(_) => {
             return Err(GitveilError::configuration(format!(
@@ -81,11 +92,12 @@ pub(crate) fn generate(
         ));
     }
     let recipient = recipients.remove(0);
-    publish_no_replace(staging.path(), parent, &destination)?;
+    let durability = publish_no_replace(&staged_path, &destination)?;
     drop(staged_secret);
     Ok(GeneratedIdentity {
         path: destination,
         recipient,
+        durability,
     })
 }
 
@@ -94,11 +106,19 @@ pub(crate) fn recipients(
     gitveil_binary: &Path,
     requested: Option<&Path>,
 ) -> Result<Vec<AgeRecipient>> {
-    let identity = resolve_identity_path(current, requested)?;
+    let identity = resolve_recipient_input(current, requested)?;
     AgeKeygenBinary::discover(gitveil_binary)?.recipients(&identity)
 }
 
-fn resolve_identity_path(current: &Path, requested: Option<&Path>) -> Result<PathBuf> {
+fn resolve_generation_destination(current: &Path, requested: Option<&Path>) -> Result<PathBuf> {
+    resolve_selected_identity_file(current, requested)
+}
+
+fn resolve_recipient_input(current: &Path, requested: Option<&Path>) -> Result<PathBuf> {
+    resolve_selected_identity_file(current, requested)
+}
+
+fn resolve_selected_identity_file(current: &Path, requested: Option<&Path>) -> Result<PathBuf> {
     let selected = if let Some(path) = requested {
         path.to_path_buf()
     } else if let Some(path) = nonempty_environment_path("SOPS_AGE_KEY_FILE")? {
@@ -138,27 +158,100 @@ fn nonempty_environment_path(name: &str) -> Result<Option<PathBuf>> {
 }
 
 fn ensure_parent(parent: &Path) -> Result<()> {
-    let existed = parent.exists();
-    fs::create_dir_all(parent).map_err(|error| {
-        GitveilError::io(
-            "create identity directory",
-            Some(parent.to_path_buf()),
-            &error,
-        )
-    })?;
-    if !existed {
-        fs::set_permissions(parent, fs::Permissions::from_mode(0o700)).map_err(|error| {
-            GitveilError::io(
-                "secure identity directory",
-                Some(parent.to_path_buf()),
-                &error,
-            )
-        })?;
+    let mut missing = Vec::new();
+    let mut cursor = parent;
+    loop {
+        match fs::symlink_metadata(cursor) {
+            Ok(metadata) if metadata.is_dir() => break,
+            Ok(_) => {
+                return Err(GitveilError::configuration(format!(
+                    "identity directory path is not a directory: {}",
+                    cursor.display()
+                )));
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                missing.push(cursor.to_path_buf());
+                cursor = cursor.parent().ok_or_else(|| {
+                    GitveilError::configuration("identity directory has no existing ancestor")
+                })?;
+            }
+            Err(error) => {
+                return Err(GitveilError::io(
+                    "inspect identity directory",
+                    Some(cursor.to_path_buf()),
+                    &error,
+                ));
+            }
+        }
+    }
+
+    for directory in missing.into_iter().rev() {
+        let mut builder = fs::DirBuilder::new();
+        builder.mode(0o700);
+        match builder.create(&directory) {
+            Ok(()) => {
+                fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).map_err(
+                    |error| {
+                        GitveilError::io(
+                            "secure created identity directory",
+                            Some(directory.clone()),
+                            &error,
+                        )
+                    },
+                )?;
+            }
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                let metadata = fs::symlink_metadata(&directory).map_err(|inspect_error| {
+                    GitveilError::io(
+                        "inspect concurrently created identity directory",
+                        Some(directory.clone()),
+                        &inspect_error,
+                    )
+                })?;
+                if !metadata.is_dir() {
+                    return Err(GitveilError::configuration(format!(
+                        "identity directory path is not a directory: {}",
+                        directory.display()
+                    )));
+                }
+            }
+            Err(error) => {
+                return Err(GitveilError::io(
+                    "create private identity directory",
+                    Some(directory),
+                    &error,
+                ));
+            }
+        }
     }
     Ok(())
 }
 
 fn secure_generated_identity(path: &Path) -> Result<()> {
+    let path_metadata = fs::symlink_metadata(path).map_err(|error| {
+        GitveilError::io(
+            "inspect generated identity path",
+            Some(path.to_path_buf()),
+            &error,
+        )
+    })?;
+    if !path_metadata.is_file()
+        || path_metadata.file_type().is_symlink()
+        || path_metadata.nlink() != 1
+    {
+        return Err(GitveilError::new(
+            ErrorCategory::Protocol,
+            "age-keygen did not create an independent regular identity file",
+        ));
+    }
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600)).map_err(|error| {
+        GitveilError::io(
+            "set generated identity permissions",
+            Some(path.to_path_buf()),
+            &error,
+        )
+    })?;
+
     let file = open(
         path,
         OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK,
@@ -195,27 +288,44 @@ fn secure_generated_identity(path: &Path) -> Result<()> {
         })
 }
 
-fn publish_no_replace(staging: &Path, parent: &Path, destination: &Path) -> Result<()> {
+fn publish_no_replace(staged: &Path, destination: &Path) -> Result<PublishDurability> {
+    publish_no_replace_with_sync(staged, destination, File::sync_all)
+}
+
+fn publish_no_replace_with_sync(
+    staged: &Path,
+    destination: &Path,
+    sync_destination_directory: impl FnOnce(&File) -> io::Result<()>,
+) -> Result<PublishDurability> {
+    let staged_parent = staged.parent().ok_or_else(|| {
+        GitveilError::configuration("staged identity path has no parent directory")
+    })?;
+    let staged_name = staged
+        .file_name()
+        .ok_or_else(|| GitveilError::configuration("staged identity path has no file name"))?;
+    let destination_parent = destination
+        .parent()
+        .ok_or_else(|| GitveilError::configuration("identity path has no destination directory"))?;
     let destination_name = destination
         .file_name()
         .ok_or_else(|| GitveilError::configuration("identity path must name a destination file"))?;
-    let staging_directory = fs::File::open(staging).map_err(|error| {
+    let staging_directory = File::open(staged_parent).map_err(|error| {
         GitveilError::io(
             "open identity staging directory",
-            Some(staging.to_path_buf()),
+            Some(staged_parent.to_path_buf()),
             &error,
         )
     })?;
-    let destination_directory = fs::File::open(parent).map_err(|error| {
+    let destination_directory = File::open(destination_parent).map_err(|error| {
         GitveilError::io(
             "open identity destination directory",
-            Some(parent.to_path_buf()),
+            Some(destination_parent.to_path_buf()),
             &error,
         )
     })?;
     renameat_with(
         &staging_directory,
-        "identity",
+        staged_name,
         &destination_directory,
         destination_name,
         RenameFlags::NOREPLACE,
@@ -236,12 +346,9 @@ fn publish_no_replace(staging: &Path, parent: &Path, destination: &Path) -> Resu
             )
         }
     })?;
-    destination_directory.sync_all().map_err(|error| {
-        GitveilError::io(
-            "sync identity directory",
-            Some(parent.to_path_buf()),
-            &error,
-        )
+    Ok(match sync_destination_directory(&destination_directory) {
+        Ok(()) => PublishDurability::Confirmed,
+        Err(error) => PublishDurability::Unconfirmed(error.kind()),
     })
 }
 
@@ -257,6 +364,18 @@ impl StagedSecret {
 
 impl Drop for StagedSecret {
     fn drop(&mut self) {
+        let Ok(path_metadata) = fs::symlink_metadata(&self.path) else {
+            return;
+        };
+        if !path_metadata.is_file()
+            || path_metadata.file_type().is_symlink()
+            || path_metadata.nlink() != 1
+        {
+            return;
+        }
+        if fs::set_permissions(&self.path, fs::Permissions::from_mode(0o600)).is_err() {
+            return;
+        }
         let Ok(mut file) = open(
             &self.path,
             OFlags::RDWR | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK,
@@ -292,19 +411,46 @@ impl Drop for StagedSecret {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+    use std::io;
     use std::path::Path;
 
-    use super::resolve_identity_path;
+    use super::{PublishDurability, publish_no_replace_with_sync, resolve_selected_identity_file};
 
     #[test]
     fn explicit_relative_identity_paths_are_resolved_from_the_current_directory() {
         assert_eq!(
-            resolve_identity_path(
+            resolve_selected_identity_file(
                 Path::new("/work"),
                 Some(Path::new("credentials/identity.txt"))
             )
             .expect("identity path"),
             Path::new("/work/credentials/identity.txt")
         );
+    }
+
+    #[test]
+    fn a_directory_sync_failure_is_a_committed_publication_outcome() {
+        let root = tempfile::tempdir().expect("publication fixture");
+        let staging = root.path().join("staging");
+        fs::create_dir(&staging).expect("staging directory");
+        let staged = staging.join("generated-identity");
+        fs::write(&staged, b"private identity canary").expect("staged identity");
+        let destination = root.path().join("published-identity");
+
+        let durability = publish_no_replace_with_sync(&staged, &destination, |_| {
+            Err(io::Error::other("injected directory sync failure"))
+        })
+        .expect("rename commits before directory sync");
+
+        assert_eq!(
+            durability,
+            PublishDurability::Unconfirmed(io::ErrorKind::Other)
+        );
+        assert_eq!(
+            fs::read(&destination).expect("published identity"),
+            b"private identity canary"
+        );
+        assert!(!staged.exists());
     }
 }

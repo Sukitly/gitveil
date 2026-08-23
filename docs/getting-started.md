@@ -18,7 +18,7 @@ gitveil identity generate
 recipient="$(gitveil identity recipients)"
 ```
 
-Generation creates private directories at mode `0700`, writes the identity at mode `0600`, and refuses to replace any existing path. Installation itself never creates an identity.
+Generation creates every missing identity directory at mode `0700`, writes the identity at mode `0600`, and refuses to replace any existing path. Installation itself never creates an identity.
 
 To select a custom location, set it before both commands and keep that setting for commands that need plaintext access:
 
@@ -28,7 +28,11 @@ gitveil identity generate
 recipient="$(gitveil identity recipients)"
 ```
 
-`recipient` is a public, committable `age1...` string. `SOPS_AGE_KEY_FILE` contains only the path to the identity file. The private identity itself must never enter a repository, command argument, log, or chat system. Back it up securely outside the repository; plaintext cannot be recovered after every matching identity is lost.
+`recipient` is a public, committable `age1...` string. Both identity commands select one file using an explicit command option, then `SOPS_AGE_KEY_FILE`, then the platform default key file. `gitveil identity recipients` does not inspect `SOPS_AGE_KEY`, execute `SOPS_AGE_KEY_CMD`, or enumerate every identity source that SOPS may load.
+
+`SOPS_AGE_KEY_FILE` contains only the path to the identity file. The private identity itself must never enter a repository, command argument, log, or chat system. Back it up securely outside the repository; plaintext cannot be recovered after every matching identity is lost. Gitveil redacts unknown sidecar stderr and reports fixed, classified diagnostics instead.
+
+If generation warns that directory durability could not be confirmed, the identity has already been published and the command still prints its public recipient. Preserve the identity file rather than rerunning generation; use `gitveil identity recipients --identity <path>` if the recipient must be printed again.
 
 A team should not share one private identity. Each member generates an independent identity and sends only the public recipient. Add multiple recipients to the same policy during initialization:
 

@@ -5,7 +5,10 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use gitveil::sops::SOPS_VERSION;
-use support::{age_keygen_binary, assert_success, command_output, sops_binary};
+use support::{
+    age_archive, age_keygen_binary, assert_no_private_identity_output, assert_success,
+    command_output, sops_binary,
+};
 
 fn installer_command() -> Command {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -19,7 +22,9 @@ fn installer_command() -> Command {
         .arg("--sops-bin")
         .arg(sops_binary())
         .arg("--age-keygen-bin")
-        .arg(age_keygen_binary());
+        .arg(age_keygen_binary())
+        .arg("--age-keygen-archive")
+        .arg(age_archive());
     command
 }
 
@@ -109,18 +114,7 @@ fn assert_installed_layout(prefix: &Path) {
         "installed identity generation",
     );
     let private = fs::read(&identity).expect("installed generated identity");
-    assert!(
-        !output
-            .stdout
-            .windows(private.len())
-            .any(|value| value == private)
-    );
-    assert!(
-        !output
-            .stderr
-            .windows(private.len())
-            .any(|value| value == private)
-    );
+    assert_no_private_identity_output(&output, &private);
     assert_eq!(
         fs::metadata(&identity)
             .expect("installed identity metadata")
@@ -221,6 +215,8 @@ fn release_packaging_rejects_a_sidecar_with_the_wrong_checksum_without_an_archiv
             .arg(&fake_sops)
             .arg("--age-keygen-bin")
             .arg(age_keygen_binary())
+            .arg("--age-keygen-archive")
+            .arg(age_archive())
             .arg("--output-dir")
             .arg(&output_dir),
     );
@@ -238,7 +234,37 @@ fn release_packaging_rejects_a_sidecar_with_the_wrong_checksum_without_an_archiv
 }
 
 #[test]
-fn release_packaging_rejects_an_age_keygen_with_the_wrong_checksum_without_an_archive() {
+fn release_packaging_rejects_a_supplied_age_keygen_without_its_verified_archive() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let temporary = tempfile::tempdir().expect("package fixture");
+    let output_dir = temporary.path().join("output");
+
+    let output = command_output(
+        Command::new("python3")
+            .current_dir(root)
+            .env("PYTHONDONTWRITEBYTECODE", "1")
+            .env("https_proxy", "http://127.0.0.1:9")
+            .arg("scripts/package-release.py")
+            .arg("--skip-build")
+            .arg("--binary")
+            .arg(assert_cmd::cargo::cargo_bin!("gitveil"))
+            .arg("--sops-bin")
+            .arg(sops_binary())
+            .arg("--age-keygen-bin")
+            .arg(age_keygen_binary())
+            .arg("--output-dir")
+            .arg(&output_dir),
+    );
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("--age-keygen-archive is required with --age-keygen-bin")
+    );
+    assert!(!output_dir.exists());
+}
+
+#[test]
+fn release_packaging_rejects_an_age_keygen_with_the_wrong_checksum() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     let temporary = tempfile::tempdir().expect("package fixture");
     let fake_age_keygen = temporary.path().join("age-keygen");
@@ -257,6 +283,8 @@ fn release_packaging_rejects_an_age_keygen_with_the_wrong_checksum_without_an_ar
             .arg(sops_binary())
             .arg("--age-keygen-bin")
             .arg(&fake_age_keygen)
+            .arg("--age-keygen-archive")
+            .arg(age_archive())
             .arg("--output-dir")
             .arg(&output_dir),
     );
@@ -269,4 +297,35 @@ fn release_packaging_rejects_an_age_keygen_with_the_wrong_checksum_without_an_ar
         !output_dir.exists(),
         "failed packaging must emit no archive"
     );
+}
+
+#[test]
+fn release_packaging_rejects_an_unverified_age_archive() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let temporary = tempfile::tempdir().expect("package fixture");
+    let fake_archive = temporary.path().join("age.tar.gz");
+    fs::write(&fake_archive, b"not the official age archive").expect("fake age archive");
+    let output_dir = temporary.path().join("output");
+
+    let output = command_output(
+        Command::new("python3")
+            .current_dir(root)
+            .env("PYTHONDONTWRITEBYTECODE", "1")
+            .env("https_proxy", "http://127.0.0.1:9")
+            .arg("scripts/package-release.py")
+            .arg("--skip-build")
+            .arg("--binary")
+            .arg(assert_cmd::cargo::cargo_bin!("gitveil"))
+            .arg("--sops-bin")
+            .arg(sops_binary())
+            .arg("--age-keygen-bin")
+            .arg(age_keygen_binary())
+            .arg("--age-keygen-archive")
+            .arg(&fake_archive)
+            .arg("--output-dir")
+            .arg(&output_dir),
+    );
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("age checksum mismatch"));
+    assert!(!output_dir.exists());
 }

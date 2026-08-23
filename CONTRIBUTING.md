@@ -62,7 +62,7 @@ On macOS, run both through the unified gate before requesting review:
 ./scripts/check-all.sh
 ```
 
-The gates cover formatting, architecture boundaries, public documentation links, Clippy, unit and integration tests, dependency policy, release builds, and native archive validation. Integration tests use real Git and checksum-pinned SOPS executables. Initial cold runs download dependencies and build artifacts and may take substantially longer than warm runs.
+The gates cover formatting, architecture boundaries, public documentation links, Clippy, unit and integration tests, dependency policy, release builds, and native archive validation. Integration tests use real Git and checksum-pinned SOPS and age-keygen executables. Initial cold runs download dependencies and build artifacts and may take substantially longer than warm runs.
 
 GitHub Actions runs `scripts/check-host.sh` natively on Linux and macOS for every pull request and push to `main`. CI uses no repository secrets and does not publish artifacts or releases.
 

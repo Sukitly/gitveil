@@ -121,13 +121,13 @@ enum Command {
 enum IdentityCommand {
     /// Generate one native age identity without replacing an existing file
     Generate {
-        /// Identity file to create (defaults to the SOPS age identity path)
+        /// Identity file to create (defaults to `SOPS_AGE_KEY_FILE` or the platform default key file)
         #[arg(long, value_name = "PATH")]
         output: Option<PathBuf>,
     },
-    /// Print public recipients derived from an existing age identity file
+    /// Print public recipients derived from one selected native age identity file
     Recipients {
-        /// Identity file to read (defaults to the SOPS age identity path)
+        /// Identity file to read (defaults to `SOPS_AGE_KEY_FILE` or the platform default key file)
         #[arg(long, value_name = "PATH")]
         identity: Option<PathBuf>,
     },
@@ -252,6 +252,14 @@ pub fn run(cli: Cli) -> Result<RunOutcome> {
     }
 }
 
+fn identity_durability_warning(path: &Path, kind: std::io::ErrorKind) -> String {
+    format!(
+        "gitveil: warning: identity was published at {}, but directory durability could not be confirmed ({kind:?}); preserve the file and run gitveil identity recipients --identity {} if recipient output is lost",
+        path.display(),
+        path.display()
+    )
+}
+
 fn run_identity(
     current: &Path,
     gitveil_binary: &Path,
@@ -262,6 +270,9 @@ fn run_identity(
             let generated = identity::generate(current, gitveil_binary, output.as_deref())?;
             println!("created age identity at {}", generated.path().display());
             println!("recipient: {}", generated.recipient());
+            if let identity::PublishDurability::Unconfirmed(kind) = generated.durability() {
+                eprintln!("{}", identity_durability_warning(generated.path(), kind));
+            }
         }
         IdentityCommand::Recipients { identity: path } => {
             for recipient in identity::recipients(current, gitveil_binary, path.as_deref())? {
@@ -507,7 +518,9 @@ pub fn parse() -> Cli {
 
 #[cfg(test)]
 mod tests {
-    use super::{Tone, error_exit_code, paint, shell_quote, status_tone};
+    use super::{
+        Tone, error_exit_code, identity_durability_warning, paint, shell_quote, status_tone,
+    };
     use crate::baseline::BaselineDiff;
     use crate::error::ErrorCategory;
     use crate::status::{PairDataStatus, PairStatus, RecipientStatus};
@@ -578,6 +591,19 @@ mod tests {
         assert_eq!(shell_quote("packages/api/.env"), "packages/api/.env");
         assert_eq!(shell_quote("secret $HOME.env"), "'secret $HOME.env'");
         assert_eq!(shell_quote("secret'file.env"), "'secret'\"'\"'file.env'");
+    }
+
+    #[test]
+    fn post_publish_sync_warning_names_the_committed_identity_and_recovery_command() {
+        let warning = identity_durability_warning(
+            std::path::Path::new("/home/dev/.config/sops/age/keys.txt"),
+            std::io::ErrorKind::Other,
+        );
+        assert!(warning.contains("identity was published at /home/dev/.config/sops/age/keys.txt"));
+        assert!(warning.contains("directory durability could not be confirmed"));
+        assert!(warning.contains(
+            "gitveil identity recipients --identity /home/dev/.config/sops/age/keys.txt"
+        ));
     }
 
     #[test]

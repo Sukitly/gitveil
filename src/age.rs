@@ -1,5 +1,5 @@
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, ExitStatus};
 use std::time::Duration;
 
 use semver::Version;
@@ -7,6 +7,12 @@ use semver::Version;
 use crate::error::{ErrorCategory, GitveilError, Result};
 use crate::recipient::AgeRecipient;
 use crate::runtime::{packaged_sidecar_path, run_capture};
+
+mod classify;
+
+use classify::{
+    GenerationFailure, RecipientFailure, classify_generation, classify_recipient, parse_recipients,
+};
 
 pub(crate) const AGE_KEYGEN_VERSION: (u64, u64, u64) = (1, 3, 1);
 const PROCESS_TIMEOUT: Duration = Duration::from_secs(30);
@@ -19,15 +25,26 @@ pub(crate) struct AgeKeygenBinary {
 impl AgeKeygenBinary {
     pub(crate) fn discover(gitveil_binary: &Path) -> Result<Self> {
         let packaged = packaged_sidecar_path(gitveil_binary, "age-keygen")?;
-        let path = std::env::var_os("AGE_KEYGEN_BIN")
-            .map(PathBuf::from)
-            .or_else(|| packaged.is_file().then_some(packaged.clone()))
-            .ok_or_else(|| {
-                GitveilError::dependency(format!(
-                    "packaged age-keygen sidecar was not found at {}; reinstall Gitveil",
-                    packaged.display()
-                ))
-            })?;
+        let path = if let Some(configured) = std::env::var_os("AGE_KEYGEN_BIN") {
+            let configured = PathBuf::from(configured);
+            if configured.as_os_str().is_empty() {
+                return Err(GitveilError::dependency("AGE_KEYGEN_BIN cannot be empty"));
+            }
+            if !configured.is_file() {
+                return Err(GitveilError::dependency(format!(
+                    "AGE_KEYGEN_BIN does not point to a file: {}",
+                    configured.display()
+                )));
+            }
+            configured
+        } else if packaged.is_file() {
+            packaged
+        } else {
+            return Err(GitveilError::dependency(format!(
+                "packaged age-keygen sidecar was not found at {}; reinstall Gitveil",
+                packaged.display()
+            )));
+        };
         let binary = Self { path };
         binary.verify_version()?;
         Ok(binary)
@@ -38,10 +55,28 @@ impl AgeKeygenBinary {
         command.arg("-o").arg(output);
         let result = run_capture(command, None, PROCESS_TIMEOUT, "age-keygen")?;
         if !result.status.success() {
-            return Err(GitveilError::new(
-                ErrorCategory::Process,
-                "age-keygen identity generation failed",
-            ));
+            let error = match classify_generation(result.stderr.as_slice()) {
+                GenerationFailure::NoSpace => GitveilError::new(
+                    ErrorCategory::Io,
+                    "age-keygen could not write the identity: no space left on device",
+                ),
+                GenerationFailure::PermissionDenied => GitveilError::new(
+                    ErrorCategory::Io,
+                    "age-keygen could not write the identity: permission denied",
+                ),
+                GenerationFailure::ReadOnlyFilesystem => GitveilError::new(
+                    ErrorCategory::Io,
+                    "age-keygen could not write the identity: read-only file system",
+                ),
+                GenerationFailure::OutputIo => GitveilError::new(
+                    ErrorCategory::Io,
+                    "age-keygen could not write the identity: input/output failure",
+                ),
+                GenerationFailure::Execution => {
+                    process_exit_error("age-keygen identity generation failed", result.status)
+                }
+            };
+            return Err(error);
         }
         Ok(())
     }
@@ -51,46 +86,38 @@ impl AgeKeygenBinary {
         command.arg("-y").arg(identity);
         let output = run_capture(command, None, PROCESS_TIMEOUT, "age-keygen")?;
         if !output.status.success() {
-            return Err(GitveilError::new(
-                ErrorCategory::IdentityUnavailable,
-                "age-keygen could not derive recipients from the identity file",
-            ));
+            let error = match classify_recipient(output.stderr.as_slice()) {
+                RecipientFailure::IdentityUnavailable => GitveilError::new(
+                    ErrorCategory::IdentityUnavailable,
+                    "age-keygen could not derive recipients from the selected identity file",
+                ),
+                RecipientFailure::InvalidIdentity => GitveilError::new(
+                    ErrorCategory::IdentityUnavailable,
+                    "selected identity file is not a valid native age identity",
+                ),
+                RecipientFailure::Protocol => GitveilError::new(
+                    ErrorCategory::Protocol,
+                    "age-keygen could not represent a native identity as a public recipient",
+                ),
+                RecipientFailure::Execution => {
+                    process_exit_error("age-keygen recipient derivation failed", output.status)
+                }
+            };
+            return Err(error);
         }
-        let stdout = std::str::from_utf8(output.stdout.as_slice()).map_err(|_| {
-            GitveilError::new(
-                ErrorCategory::Protocol,
-                "age-keygen recipient output is not UTF-8",
-            )
-        })?;
-        let recipients = stdout
-            .lines()
-            .filter(|line| !line.is_empty())
-            .map(|line| {
-                AgeRecipient::new(line).map_err(|_| {
-                    GitveilError::new(
-                        ErrorCategory::Protocol,
-                        "age-keygen returned an invalid public recipient",
-                    )
-                })
-            })
-            .collect::<Result<Vec<_>>>()?;
-        if recipients.is_empty() {
-            return Err(GitveilError::new(
-                ErrorCategory::Protocol,
-                "age-keygen returned no public recipients",
-            ));
-        }
-        Ok(recipients)
+        parse_recipients(output.stdout.as_slice())
     }
 
     fn verify_version(&self) -> Result<()> {
         let mut command = Command::new(&self.path);
         command.arg("--version");
-        let output = run_capture(command, None, Duration::from_secs(15), "age-keygen")?;
+        let output = run_capture(command, None, Duration::from_secs(15), "age-keygen")
+            .map_err(classify_dependency_process_error)?;
         if !output.status.success() {
-            return Err(GitveilError::dependency(
-                "age-keygen version check failed with a non-zero exit code",
-            ));
+            return Err(GitveilError::dependency(format!(
+                "age-keygen version check failed {}",
+                exit_status_description(output.status)
+            )));
         }
         let stdout = std::str::from_utf8(output.stdout.as_slice())
             .map_err(|_| GitveilError::dependency("age-keygen version output is not UTF-8"))?;
@@ -120,4 +147,22 @@ impl AgeKeygenBinary {
         }
         Ok(())
     }
+}
+
+fn process_exit_error(operation: &str, status: ExitStatus) -> GitveilError {
+    GitveilError::new(
+        ErrorCategory::Process,
+        format!("{operation} {}", exit_status_description(status)),
+    )
+}
+
+fn exit_status_description(status: ExitStatus) -> String {
+    status.code().map_or_else(
+        || "after termination by signal".to_owned(),
+        |code| format!("with exit code {code}"),
+    )
+}
+
+fn classify_dependency_process_error(_error: GitveilError) -> GitveilError {
+    GitveilError::dependency("age-keygen dependency version check could not be completed")
 }

@@ -6,7 +6,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use support::{
-    age_keygen_binary, assert_success, child_output, command_output, generate_age_identity,
+    age_keygen_binary, assert_no_private_identity_output, assert_success, child_output,
+    command_output, generate_age_identity,
 };
 
 fn binary() -> PathBuf {
@@ -30,6 +31,24 @@ impl IdentityFixture {
 
     fn command(&self) -> Command {
         let mut command = Command::new(binary());
+        self.isolate(&mut command);
+        command
+    }
+
+    fn command_with_restrictive_umask(&self) -> Command {
+        let mut command = Command::new("sh");
+        command
+            .args([
+                "-c",
+                "umask 0777; program=$1; shift; exec \"$program\" \"$@\"",
+                "gitveil-identity-test",
+            ])
+            .arg(binary());
+        self.isolate(&mut command);
+        command
+    }
+
+    fn isolate(&self, command: &mut Command) {
         command
             .current_dir(self.root.path())
             .env("HOME", &self.home)
@@ -38,7 +57,6 @@ impl IdentityFixture {
             .env_remove("SOPS_AGE_KEY")
             .env_remove("SOPS_AGE_KEY_FILE")
             .env_remove("SOPS_AGE_KEY_CMD");
-        command
     }
 
     fn default_identity(&self) -> PathBuf {
@@ -61,7 +79,11 @@ fn recipient_from_age_keygen(identity: &Path) -> String {
 fn generate_creates_the_default_identity_without_revealing_private_material() {
     let fixture = IdentityFixture::new();
     let output = assert_success(
-        command_output(fixture.command().args(["identity", "generate"])),
+        command_output(
+            fixture
+                .command_with_restrictive_umask()
+                .args(["identity", "generate"]),
+        ),
         "generate identity",
     );
 
@@ -81,26 +103,19 @@ fn generate_creates_the_default_identity_without_revealing_private_material() {
             & 0o777,
         0o600
     );
-    assert_eq!(
-        fs::metadata(identity_path.parent().expect("identity parent"))
-            .expect("identity parent metadata")
-            .permissions()
-            .mode()
-            & 0o777,
-        0o700
-    );
-    assert!(
-        !output
-            .stdout
-            .windows(identity.len())
-            .any(|value| value == identity)
-    );
-    assert!(
-        !output
-            .stderr
-            .windows(identity.len())
-            .any(|value| value == identity)
-    );
+    for directory in [fixture.xdg.join("sops"), fixture.xdg.join("sops/age")] {
+        assert_eq!(
+            fs::metadata(&directory)
+                .expect("created identity directory metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700,
+            "{} must be owner-only",
+            directory.display()
+        );
+    }
+    assert_no_private_identity_output(&output, &identity);
 
     let recipient = recipient_from_age_keygen(&identity_path);
     let stdout = String::from_utf8(output.stdout).expect("generate output UTF-8");
@@ -114,7 +129,7 @@ fn generate_creates_the_default_identity_without_revealing_private_material() {
 #[test]
 fn generation_uses_the_platform_sops_path_when_xdg_is_unset() {
     let fixture = IdentityFixture::new();
-    let mut command = fixture.command();
+    let mut command = fixture.command_with_restrictive_umask();
     command.env_remove("XDG_CONFIG_HOME");
     assert_success(
         command_output(command.args(["identity", "generate"])),
@@ -122,13 +137,36 @@ fn generation_uses_the_platform_sops_path_when_xdg_is_unset() {
     );
 
     #[cfg(target_os = "macos")]
-    let identity = fixture
-        .home
-        .join("Library/Application Support/sops/age/keys.txt");
+    let created_directories = [
+        fixture.home.join("Library"),
+        fixture.home.join("Library/Application Support"),
+        fixture.home.join("Library/Application Support/sops"),
+        fixture.home.join("Library/Application Support/sops/age"),
+    ];
     #[cfg(target_os = "linux")]
-    let identity = fixture.home.join(".config/sops/age/keys.txt");
+    let created_directories = [
+        fixture.home.join(".config"),
+        fixture.home.join(".config/sops"),
+        fixture.home.join(".config/sops/age"),
+    ];
+    let identity = created_directories
+        .last()
+        .expect("identity directory")
+        .join("keys.txt");
     assert!(identity.is_file());
     assert!(recipient_from_age_keygen(&identity).starts_with("age1"));
+    for directory in created_directories {
+        assert_eq!(
+            fs::metadata(&directory)
+                .expect("platform identity directory metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700,
+            "{} must be owner-only",
+            directory.display()
+        );
+    }
 }
 
 #[test]
@@ -165,18 +203,103 @@ fn recipients_uses_the_default_or_explicit_identity_and_prints_only_public_value
         format!("{explicit_recipient}\n").as_bytes()
     );
     let private = fs::read(explicit_identity).expect("explicit private identity");
+    assert_no_private_identity_output(&explicit_output, &private);
+}
+
+#[test]
+fn recipients_reads_only_the_selected_identity_file() {
+    let fixture = IdentityFixture::new();
+    let marker = fixture.root.path().join("identity-command-ran");
+    let command_source = fixture.root.path().join("identity-command");
+    fs::write(
+        &command_source,
+        format!("#!/bin/sh\ntouch '{}'\n", marker.display()),
+    )
+    .expect("identity command");
+    fs::set_permissions(&command_source, fs::Permissions::from_mode(0o700))
+        .expect("identity command mode");
+
+    let mut command = fixture.command();
+    command
+        .env("SOPS_AGE_KEY", "AGE-SECRET-KEY-INLINE-CANARY")
+        .env("SOPS_AGE_KEY_CMD", &command_source);
+    let output = command_output(command.args(["identity", "recipients"]));
+
+    assert_eq!(output.status.code(), Some(1));
     assert!(
-        !explicit_output
-            .stdout
-            .windows(private.len())
-            .any(|value| value == private)
+        String::from_utf8_lossy(&output.stderr)
+            .contains("could not derive recipients from the selected identity file")
     );
+    assert!(!marker.exists());
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("INLINE-CANARY"));
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("INLINE-CANARY"));
+}
+
+#[test]
+fn recipients_reports_missing_and_invalid_identity_files_without_leaking_input() {
+    let fixture = IdentityFixture::new();
+    let missing = fixture.root.path().join("missing-identity.txt");
+    let missing_output = command_output(fixture.command().args([
+        "identity",
+        "recipients",
+        "--identity",
+        missing.to_str().expect("missing identity path UTF-8"),
+    ]));
+    assert_eq!(missing_output.status.code(), Some(1));
     assert!(
-        !explicit_output
-            .stderr
-            .windows(private.len())
-            .any(|value| value == private)
+        String::from_utf8_lossy(&missing_output.stderr)
+            .contains("could not derive recipients from the selected identity file")
     );
+
+    let invalid = fixture.root.path().join("invalid-identity.txt");
+    fs::write(&invalid, b"AGE-SECRET-KEY-INVALID-INPUT-CANARY\n").expect("invalid identity");
+    let invalid_output = command_output(fixture.command().args([
+        "identity",
+        "recipients",
+        "--identity",
+        invalid.to_str().expect("invalid identity path UTF-8"),
+    ]));
+    assert_eq!(invalid_output.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&invalid_output.stderr)
+            .contains("selected identity file is not a valid native age identity")
+    );
+    assert!(!String::from_utf8_lossy(&invalid_output.stdout).contains("INPUT-CANARY"));
+    assert!(!String::from_utf8_lossy(&invalid_output.stderr).contains("INPUT-CANARY"));
+}
+
+#[test]
+fn recipient_protocol_failures_are_distinct_and_redacted() {
+    let fixture = IdentityFixture::new();
+    let fake = fixture.root.path().join("recipient-output-age-keygen");
+    fs::write(
+        &fake,
+        "#!/bin/sh\nif [ \"${1:-}\" = \"--version\" ]; then\n  printf 'v1.3.1\\n'\n  exit 0\nfi\ncase \"$RECIPIENT_OUTPUT\" in\n  non-utf8) printf '\\377' ;;\n  invalid) printf 'not-an-age-recipient\\n' ;;\n  empty) : ;;\nesac\n",
+    )
+    .expect("recipient-output age-keygen");
+    fs::set_permissions(&fake, fs::Permissions::from_mode(0o700))
+        .expect("recipient-output age-keygen mode");
+    let identity = fixture.root.path().join("unused-identity.txt");
+
+    for (mode, diagnostic) in [
+        ("non-utf8", "recipient output is not UTF-8"),
+        ("invalid", "returned an invalid public recipient"),
+        ("empty", "returned no public recipients"),
+    ] {
+        let mut command = fixture.command();
+        command
+            .env("AGE_KEYGEN_BIN", &fake)
+            .env("RECIPIENT_OUTPUT", mode);
+        let output = command_output(command.args([
+            "identity",
+            "recipients",
+            "--identity",
+            identity.to_str().expect("identity path UTF-8"),
+        ]));
+        assert_eq!(output.status.code(), Some(1));
+        assert!(String::from_utf8_lossy(&output.stderr).contains(diagnostic));
+        assert!(!String::from_utf8_lossy(&output.stderr).contains("not-an-age-recipient"));
+    }
 }
 
 #[test]
@@ -276,7 +399,7 @@ fn generation_failure_leaves_no_identity_and_redacts_child_output() {
     fs::set_permissions(&fake, fs::Permissions::from_mode(0o700)).expect("fake executable mode");
 
     let identity_path = fixture.root.path().join("failed.txt");
-    let mut command = fixture.command();
+    let mut command = fixture.command_with_restrictive_umask();
     command.env("AGE_KEYGEN_BIN", &fake);
     let output = command_output(command.args([
         "identity",
@@ -297,6 +420,36 @@ fn generation_failure_leaves_no_identity_and_redacts_child_output() {
                 .to_string_lossy()
                 .starts_with(".gitveil-identity-"))
     );
+}
+
+#[test]
+fn generation_reports_safe_classified_output_failures() {
+    let fixture = IdentityFixture::new();
+    let fake = fixture.root.path().join("no-space-age-keygen");
+    fs::write(
+        &fake,
+        "#!/bin/sh\nif [ \"${1:-}\" = \"--version\" ]; then\n  printf 'v1.3.1\\n'\n  exit 0\nfi\nprintf '%s\\n' 'age-keygen: error: failed to close output file: no space left on device' >&2\nprintf '%s\\n' 'AGE-SECRET-KEY-CLASSIFIER-CANARY' >&2\nexit 9\n",
+    )
+    .expect("no-space age-keygen");
+    fs::set_permissions(&fake, fs::Permissions::from_mode(0o700))
+        .expect("no-space age-keygen mode");
+    let identity = fixture.root.path().join("no-space.txt");
+    let mut command = fixture.command();
+    command.env("AGE_KEYGEN_BIN", &fake);
+    let output = command_output(command.args([
+        "identity",
+        "generate",
+        "--output",
+        identity.to_str().expect("identity path UTF-8"),
+    ]));
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("age-keygen could not write the identity: no space left on device")
+    );
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("CLASSIFIER-CANARY"));
+    assert!(!identity.exists());
 }
 
 #[test]
@@ -404,7 +557,7 @@ fn identity_commands_never_fall_back_to_age_keygen_on_path() {
 }
 
 #[test]
-fn identity_commands_reject_a_missing_or_wrong_version_sidecar() {
+fn identity_generation_reports_an_age_keygen_override_that_cannot_start() {
     let fixture = IdentityFixture::new();
     let missing = fixture.root.path().join("missing-age-keygen");
     let unavailable_identity = fixture.root.path().join("unavailable/identity.txt");
@@ -416,8 +569,11 @@ fn identity_commands_reject_a_missing_or_wrong_version_sidecar() {
         "--output",
         unavailable_identity.to_str().expect("identity path UTF-8"),
     ]));
+
     assert_eq!(output.status.code(), Some(1));
-    assert!(String::from_utf8_lossy(&output.stderr).contains("age-keygen"));
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("AGE_KEYGEN_BIN does not point to a file")
+    );
     assert!(!unavailable_identity.exists());
     assert!(
         !unavailable_identity
@@ -425,7 +581,11 @@ fn identity_commands_reject_a_missing_or_wrong_version_sidecar() {
             .expect("identity parent")
             .exists()
     );
+}
 
+#[test]
+fn identity_commands_reject_a_wrong_version_sidecar() {
+    let fixture = IdentityFixture::new();
     let wrong = fixture.root.path().join("wrong-age-keygen");
     fs::write(&wrong, "#!/bin/sh\nprintf 'v1.2.0\\n'\n").expect("wrong age-keygen");
     fs::set_permissions(&wrong, fs::Permissions::from_mode(0o700)).expect("wrong executable mode");

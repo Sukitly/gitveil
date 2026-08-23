@@ -47,6 +47,28 @@ pub fn age_keygen_binary() -> PathBuf {
         .join("age-keygen")
 }
 
+/// Resolves the checksum-pinned official archive containing the test age-keygen executable.
+///
+/// # Panics
+/// Panics if the configured test executable path has no parent directory.
+pub fn age_archive() -> PathBuf {
+    if let Some(path) = std::env::var_os("AGE_KEYGEN_ARCHIVE") {
+        return PathBuf::from(path);
+    }
+    #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+    let filename = format!("age-v{AGE_KEYGEN_VERSION}-darwin-amd64.tar.gz");
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    let filename = format!("age-v{AGE_KEYGEN_VERSION}-darwin-arm64.tar.gz");
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    let filename = format!("age-v{AGE_KEYGEN_VERSION}-linux-amd64.tar.gz");
+    #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+    let filename = format!("age-v{AGE_KEYGEN_VERSION}-linux-arm64.tar.gz");
+    age_keygen_binary()
+        .parent()
+        .expect("age-keygen test tool directory")
+        .join(filename)
+}
+
 /// Resolves the compatibility-baseline SOPS build used to author legacy ciphertext.
 pub fn sops_baseline_binary() -> PathBuf {
     if let Some(path) = std::env::var_os("SOPS_BASELINE_BIN") {
@@ -354,6 +376,21 @@ pub fn contains(haystack: &[u8], needle: &[u8]) -> bool {
     haystack
         .windows(needle.len())
         .any(|window| window == needle)
+}
+
+/// Asserts that process output contains neither an age secret marker nor the actual secret line.
+///
+/// # Panics
+/// Panics if the fixture is not an age identity or protected material appears in process output.
+pub fn assert_no_private_identity_output(output: &Output, identity: &[u8]) {
+    let secret_line = identity
+        .split(|byte| *byte == b'\n')
+        .find(|line| line.starts_with(b"AGE-SECRET-KEY-"))
+        .expect("generated identity secret line");
+    for stream in [&output.stdout, &output.stderr] {
+        assert!(!contains(stream, b"AGE-SECRET-KEY-"));
+        assert!(!contains(stream, secret_line));
+    }
 }
 
 /// Extracts the `ENC[...]` payload of one encrypted leaf from a SOPS YAML document.

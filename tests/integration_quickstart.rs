@@ -318,7 +318,10 @@ fn executable_example_redacts_age_keygen_failure_and_cleans_up() {
     );
 
     assert!(!output.status.success());
-    assert!(contains(&output.stderr, b"age-keygen"));
+    assert!(contains(
+        &output.stderr,
+        b"age-keygen identity generation failed with exit code 9"
+    ));
     assert_no_secret_output(
         &output,
         &[
@@ -364,7 +367,7 @@ fn executable_example_does_not_treat_a_git_ignore_failure_as_not_ignored() {
 }
 
 #[test]
-fn executable_example_reports_missing_age_keygen_before_creating_an_identity() {
+fn executable_example_cleans_up_its_workspace_when_age_keygen_cannot_start() {
     let fixture = QuickstartFixture::new();
     let mut command = fixture.command();
     command.env(
@@ -377,7 +380,14 @@ fn executable_example_reports_missing_age_keygen_before_creating_an_identity() {
     );
 
     assert!(!output.status.success());
-    assert!(contains(&output.stderr, b"age-keygen"));
+    assert!(contains(
+        &output.stderr,
+        b"AGE_KEYGEN_BIN does not point to a file"
+    ));
+    assert!(contains(
+        &output.stderr,
+        b"Gitveil quickstart failed: gitveil identity generation failed"
+    ));
     assert_no_secret_output(&output, &[b"AGE-SECRET-KEY-", b"age1", PLAINTEXT_CANARY]);
     fixture.assert_no_workspaces();
 }

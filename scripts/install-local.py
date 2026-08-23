@@ -139,6 +139,7 @@ def main() -> int:
     parser.add_argument("--binary", type=Path, help=argparse.SUPPRESS)
     parser.add_argument("--sops-bin", type=Path, help=argparse.SUPPRESS)
     parser.add_argument("--age-keygen-bin", type=Path, help=argparse.SUPPRESS)
+    parser.add_argument("--age-keygen-archive", type=Path, help=argparse.SUPPRESS)
     parser.add_argument("--skip-build", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
 
@@ -150,12 +151,20 @@ def main() -> int:
     age_keygen_binary = (
         args.age_keygen_bin.resolve() if args.age_keygen_bin else None
     )
+    age_keygen_archive = (
+        args.age_keygen_archive.resolve() if args.age_keygen_archive else None
+    )
     prefix = (args.prefix or default_prefix()).expanduser().resolve()
     archive_root = archive_root_name(root)
 
     with tempfile.TemporaryDirectory(prefix="gitveil-local-package-") as temporary:
         archive = build_archive(
-            root, Path(temporary), binary, sops_binary, age_keygen_binary
+            root,
+            Path(temporary),
+            binary,
+            sops_binary,
+            age_keygen_binary,
+            age_keygen_archive,
         )
         install_archive(archive, archive_root, prefix)
 

@@ -17,6 +17,7 @@ def main() -> int:
     parser.add_argument("--binary", type=Path)
     parser.add_argument("--sops-bin", type=Path)
     parser.add_argument("--age-keygen-bin", type=Path)
+    parser.add_argument("--age-keygen-archive", type=Path)
     parser.add_argument("--skip-build", action="store_true")
     args = parser.parse_args()
 
@@ -28,9 +29,17 @@ def main() -> int:
     age_keygen_binary = (
         args.age_keygen_bin.resolve() if args.age_keygen_bin else None
     )
+    age_keygen_archive = (
+        args.age_keygen_archive.resolve() if args.age_keygen_archive else None
+    )
     output_dir = args.output_dir if args.output_dir.is_absolute() else root / args.output_dir
     archive = build_archive(
-        root, output_dir, binary, sops_binary, age_keygen_binary
+        root,
+        output_dir,
+        binary,
+        sops_binary,
+        age_keygen_binary,
+        age_keygen_archive,
     )
     checksum = digest(archive)
     checksum_file = archive.with_suffix(f"{archive.suffix}.sha256")

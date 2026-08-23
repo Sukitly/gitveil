@@ -53,6 +53,14 @@ fn identity_help_lists_generation_and_recipient_derivation() {
         help.lines()
             .any(|line| line.trim_start().starts_with("recipients"))
     );
+
+    let output = command_output(Command::new(binary()).args(["identity", "recipients", "--help"]));
+    assert_eq!(output.status.code(), Some(0));
+    let help = String::from_utf8(output.stdout).expect("recipient help UTF-8");
+    let normalized = help.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(normalized.contains("SOPS_AGE_KEY_FILE"));
+    assert!(normalized.contains("platform default key file"));
+    assert!(!normalized.contains("SOPS_AGE_KEY_CMD"));
 }
 
 #[test]

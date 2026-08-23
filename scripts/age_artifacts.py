@@ -143,7 +143,8 @@ def age_keygen_digest(archive: Path) -> str:
         return hashlib.sha256(source.read()).hexdigest()
 
 
-def verify_binary(path: Path, archive: Path) -> None:
+def verify_binary(path: Path, archive: Path, artifact: Artifact) -> None:
+    verify_archive(archive, artifact)
     expected = age_keygen_digest(archive)
     actual = digest(path)
     if actual != expected:
@@ -184,9 +185,11 @@ def fetch_verified(destination: Path, artifact: Artifact) -> Path:
         destination.chmod(destination.stat().st_mode | stat.S_IXUSR)
         return destination
     extracted = extract_verified_age_keygen(archive, destination)
-    if digest(extracted) != expected_binary_digest:
+    try:
+        verify_binary(extracted, archive, artifact)
+    except ValueError:
         extracted.unlink(missing_ok=True)
-        raise ValueError("extracted age-keygen does not match the verified archive")
+        raise
     return extracted
 
 

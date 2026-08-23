@@ -65,5 +65,6 @@ docker run --rm \
             --binary target/release/gitveil \
             --sops-bin /usr/local/bin/sops \
             --age-keygen-bin /usr/local/bin/age-keygen \
+            --age-keygen-archive /usr/local/share/gitveil-test/age.tar.gz \
             --output-dir target/package-test
     '
