@@ -64,5 +64,6 @@ docker run --rm \
             --skip-build \
             --binary target/release/gitveil \
             --sops-bin /usr/local/bin/sops \
+            --age-keygen-bin /usr/local/bin/age-keygen \
             --output-dir target/package-test
     '

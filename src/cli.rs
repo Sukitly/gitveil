@@ -4,6 +4,7 @@ use clap::{Parser, Subcommand};
 
 use crate::configure::{AddOutcomeKind, add, initialize};
 use crate::error::{ErrorCategory, GitveilError, Result};
+use crate::identity;
 use crate::open::{OpenOutcome, open};
 use crate::resolve::{ResolveOutcome, resolve};
 use crate::runtime::{read_editor_token, run_internal_editor};
@@ -14,6 +15,7 @@ use crate::workspace::Workspace;
 
 const AFTER_HELP: &str = "\
 Examples:
+  gitveil identity generate
   gitveil init --recipient age1...
   gitveil add .env --format dotenv
   gitveil open
@@ -39,6 +41,11 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Generate local age identities and derive their public recipients
+    Identity {
+        #[command(subcommand)]
+        command: IdentityCommand,
+    },
     /// Initialize Gitveil configuration at the Git repository root
     Init {
         /// Name of the initial recipient policy
@@ -107,6 +114,22 @@ enum Command {
         #[arg(long)]
         runtime: PathBuf,
         target: PathBuf,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum IdentityCommand {
+    /// Generate one native age identity without replacing an existing file
+    Generate {
+        /// Identity file to create (defaults to the SOPS age identity path)
+        #[arg(long, value_name = "PATH")]
+        output: Option<PathBuf>,
+    },
+    /// Print public recipients derived from an existing age identity file
+    Recipients {
+        /// Identity file to read (defaults to the SOPS age identity path)
+        #[arg(long, value_name = "PATH")]
+        identity: Option<PathBuf>,
     },
 }
 
@@ -191,6 +214,7 @@ pub fn run(cli: Cli) -> Result<RunOutcome> {
     let gitveil_binary = std::env::current_exe()
         .map_err(|error| GitveilError::io("resolve current executable", None, &error))?;
     match cli.command {
+        Command::Identity { command } => run_identity(&current, &gitveil_binary, command),
         Command::Init { policy, recipient } => run_initialize(&current, &policy, &recipient),
         Command::Add {
             format,
@@ -226,6 +250,26 @@ pub fn run(cli: Cli) -> Result<RunOutcome> {
             Ok(RunOutcome::Success)
         }
     }
+}
+
+fn run_identity(
+    current: &Path,
+    gitveil_binary: &Path,
+    command: IdentityCommand,
+) -> Result<RunOutcome> {
+    match command {
+        IdentityCommand::Generate { output } => {
+            let generated = identity::generate(current, gitveil_binary, output.as_deref())?;
+            println!("created age identity at {}", generated.path().display());
+            println!("recipient: {}", generated.recipient());
+        }
+        IdentityCommand::Recipients { identity: path } => {
+            for recipient in identity::recipients(current, gitveil_binary, path.as_deref())? {
+                println!("{recipient}");
+            }
+        }
+    }
+    Ok(RunOutcome::Success)
 }
 
 fn run_initialize(current: &Path, policy: &str, recipients: &[String]) -> Result<RunOutcome> {

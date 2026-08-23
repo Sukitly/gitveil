@@ -9,9 +9,8 @@ Gitveil provides file-level encryption for dotenv, JSON, YAML, and TOML secret f
 - macOS or Linux
 - Git 2.20+ for `verify` and `resolve`
 - A matching age identity on machines that need plaintext access
-- An external `age-keygen` executable for initial identity generation; existing identities and keyless commands do not require it
 
-Gitveil itself does not require a system SOPS or age executable. Release archives include a checksum-verified official SOPS 3.13.3 sidecar at `libexec/gitveil/sops`; Gitveil does not search for SOPS on the system `PATH`.
+Gitveil does not require a system SOPS or age executable. Release archives include checksum-verified official SOPS 3.13.3 and age-keygen 1.3.1 sidecars under `libexec/gitveil/`; Gitveil does not search for either tool on the system `PATH`.
 
 ## Installation
 
@@ -27,7 +26,7 @@ The default prefix is `${CARGO_HOME:-$HOME/.cargo}`. To select another prefix:
 ./scripts/install-local.py --prefix ~/.local
 ```
 
-The installer performs a locked release build, fetches and verifies official SOPS 3.13.3, validates the complete release archive, and transactionally installs the binary, private sidecar, and license files. Do not use `cargo install --path .`: Cargo installs only the binary and omits the private sidecar.
+The installer performs a locked release build, fetches and verifies official SOPS 3.13.3 and age-keygen 1.3.1 artifacts, validates the complete release archive, and transactionally installs the binary, private sidecars, and license files. Do not use `cargo install --path .`: Cargo installs only the binary and omits the private sidecars.
 
 The user-facing installation unit is a native release archive. Maintainers build one on each target platform with:
 
@@ -40,28 +39,33 @@ The archive is written to `dist/gitveil-v<version>-<os>-<arch>.tar.gz` with this
 ```text
 bin/gitveil
 libexec/gitveil/sops
+libexec/gitveil/age-keygen
 share/licenses/gitveil/LICENSE
 share/licenses/gitveil/SOPS-MPL-2.0.txt
 share/licenses/gitveil/SOPS-NOTICE.txt
+share/licenses/gitveil/AGE-BSD-3-Clause.txt
+share/licenses/gitveil/AGE-NOTICE.txt
 ```
 
 Install all three top-level directories under the same prefix and place `<prefix>/bin` on `PATH`. Gitveil never downloads executables at runtime.
 
-Source development and tests may explicitly override the private sidecar with `SOPS_BIN`; the override must still be SOPS 3.13.3. This variable is not part of the user installation contract.
+Source development and tests may explicitly override the private sidecars with `SOPS_BIN` and `AGE_KEYGEN_BIN`; each override must still have its pinned version. These variables are not part of the user installation contract.
 
 ## Initial setup
 
-Use an external `age-keygen` once to generate a private identity and derive its public recipient. Run these commands only when the identity file does not already exist:
+Generate a private identity explicitly after installation. The command selects `SOPS_AGE_KEY_FILE` when set, then the standard SOPS identity location for the current platform, creates private directories at mode `0700`, writes the identity at mode `0600`, and never replaces an existing path:
 
 ```bash
-umask 077
-identity_file="$HOME/.config/sops/age/keys.txt"
-mkdir -p "$(dirname "$identity_file")"
-age-keygen -o "$identity_file"
-chmod 600 "$identity_file"
+gitveil identity generate
+recipient="$(gitveil identity recipients)"
+```
 
-export SOPS_AGE_KEY_FILE="$identity_file"
-recipient="$(age-keygen -y "$SOPS_AGE_KEY_FILE")"
+If a matching identity already exists, skip `generate` and use `gitveil identity recipients` to derive its public value. To use a custom location, select it consistently for generation and subsequent commands:
+
+```bash
+export SOPS_AGE_KEY_FILE="$HOME/.config/sops/age/keys.txt"
+gitveil identity generate
+recipient="$(gitveil identity recipients)"
 ```
 
 `init` and `add` must run at a Git repository root containing a `.git` file or directory. `init` accepts only public `age1...` recipients, never private identities:
@@ -70,7 +74,7 @@ recipient="$(age-keygen -y "$SOPS_AGE_KEY_FILE")"
 gitveil init --policy team --recipient "$recipient"
 ```
 
-After installing `age-keygen` and Gitveil in a source checkout, run the isolated end-to-end example to exercise identity generation, `init`, `add`, `seal`, commit, clone, `open`, `status`, and `verify` with real command output:
+From a source checkout, run the isolated end-to-end example to exercise Gitveil-managed identity generation, `init`, `add`, `seal`, commit, clone, `open`, `status`, and `verify` with real command output:
 
 ```bash
 ./examples/quickstart.sh
@@ -117,7 +121,7 @@ Gitveil does not currently provide a managed-entry removal command. Manually rem
 
 ## Identity management
 
-Gitveil does not generate, store, or synchronize private identities. Keep identity files at mode `0600`, back them up securely outside the repository, and have each team member generate an independent identity. Exchange only public recipients, never private keys. The repository stores only public `age1...` recipients. `status` and `verify` remain available without an identity. To add a member, add the member's public recipient to the manifest policy and run `gitveil seal` to rewrap access.
+Gitveil generates native age identities only when `gitveil identity generate` is explicitly invoked. It does not overwrite, synchronize, distribute, back up, or automatically rotate them. Keep identity files at mode `0600`, back them up securely outside the repository, and have each team member generate an independent identity. Exchange only public recipients, never private keys. The repository stores only public `age1...` recipients. `status` and `verify` remain available without an identity. To add a member, add the member's public recipient to the manifest policy and run `gitveil seal` to rewrap access.
 
 To remove a member, first rotate the actual secret values in plaintext, remove the member's recipient from the manifest policy, and run `gitveil seal`. When Gitveil detects a recipient removal, it encrypts the entire file under a fresh data key and reports `sealed; data key rotated`; neither the new values nor the new key are decryptable by the removed identity. Addition-only changes keep the existing data key and preserve encrypted leaf bytes.
 
@@ -190,4 +194,4 @@ The unified local quality gate covers the macOS host, Docker Linux, real SOPS co
 
 ## License
 
-Gitveil source code is available under the [MIT License](LICENSE). The official SOPS executable bundled in native release archives is distributed under the [Mozilla Public License 2.0](licenses/SOPS-MPL-2.0.txt); its version and corresponding source location are recorded in the [SOPS notice](licenses/SOPS-NOTICE.txt).
+Gitveil source code is available under the [MIT License](LICENSE). The official SOPS executable bundled in native release archives is distributed under the [Mozilla Public License 2.0](licenses/SOPS-MPL-2.0.txt); its version and source location are recorded in the [SOPS notice](licenses/SOPS-NOTICE.txt). The bundled official age-keygen executable is distributed under the [BSD 3-Clause License](licenses/AGE-BSD-3-Clause.txt); its version and source location are recorded in the [age notice](licenses/AGE-NOTICE.txt).

@@ -12,7 +12,7 @@ ARG SOPS_SHA256
 ARG SOPS_BASELINE_VERSION=3.13.2
 ARG SOPS_BASELINE_ARTIFACT
 ARG SOPS_BASELINE_SHA256
-# age-keygen is a test-only provisioning dependency for the public quickstart.
+# age-keygen is the pinned identity sidecar used by integration and packaging tests.
 ARG AGE_VERSION=1.3.1
 ARG AGE_ARTIFACT
 ARG AGE_SHA256

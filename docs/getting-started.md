@@ -1,47 +1,34 @@
 # Getting started
 
-This guide starts by generating an age identity outside Gitveil, then exercises `init`, `add`, `seal`, commit, clone, `open`, `status`, and `verify` in a temporary Git repository. Gitveil does not generate, store, or synchronize private identities.
+This guide starts by explicitly generating an age identity through Gitveil, then exercises `init`, `add`, `seal`, commit, clone, `open`, `status`, and `verify` in a temporary Git repository. Gitveil does not generate an identity during installation or without an explicit command.
 
 ## Prerequisites
 
 - Install the complete Gitveil distribution as described in the [`README.md`](../README.md); do not use only `cargo install --path .`.
 - Install Git 2.20+.
-- Install [age](https://github.com/FiloSottile/age#installation), including `age-keygen`.
 
-```bash
-# macOS
-brew install age
-
-# Debian / Ubuntu
-sudo apt install age
-
-# Fedora
-sudo dnf install age
-
-# Arch Linux
-sudo pacman -S age
-```
-
-If none of these package managers applies, install the binary for your platform from an official age release and verify its checksum. `age-keygen` is needed only to generate an identity and derive its public recipient; normal Gitveil operation does not depend on a system age executable.
+The complete distribution includes private, checksum-verified SOPS and age-keygen sidecars. Neither executable needs to be installed on the system `PATH`.
 
 ## Prepare an identity once
 
-The following commands create a long-lived local identity. Run them only when the destination does not already exist; never overwrite an existing identity:
+The following commands create a long-lived local identity at the standard SOPS location for the current platform and derive its public recipient:
 
 ```bash
-umask 077
-identity_file="$HOME/.config/sops/age/keys.txt"
-mkdir -p "$(dirname "$identity_file")"
-age-keygen -o "$identity_file"
-chmod 600 "$identity_file"
-
-export SOPS_AGE_KEY_FILE="$identity_file"
-recipient="$(age-keygen -y "$SOPS_AGE_KEY_FILE")"
+gitveil identity generate
+recipient="$(gitveil identity recipients)"
 ```
 
-`recipient` is a public, committable `age1...` string. `SOPS_AGE_KEY_FILE` contains only the path to the identity file. The private identity itself must never enter a repository, command argument, log, or chat system.
+Generation creates private directories at mode `0700`, writes the identity at mode `0600`, and refuses to replace any existing path. Installation itself never creates an identity.
 
-For regular use, set the `SOPS_AGE_KEY_FILE` path in your shell configuration. Keep the identity file at mode `0600` and back it up securely outside the repository. Plaintext cannot be recovered after every matching identity is lost.
+To select a custom location, set it before both commands and keep that setting for commands that need plaintext access:
+
+```bash
+export SOPS_AGE_KEY_FILE="$HOME/.config/sops/age/keys.txt"
+gitveil identity generate
+recipient="$(gitveil identity recipients)"
+```
+
+`recipient` is a public, committable `age1...` string. `SOPS_AGE_KEY_FILE` contains only the path to the identity file. The private identity itself must never enter a repository, command argument, log, or chat system. Back it up securely outside the repository; plaintext cannot be recovered after every matching identity is lost.
 
 A team should not share one private identity. Each member generates an independent identity and sends only the public recipient. Add multiple recipients to the same policy during initialization:
 
@@ -121,13 +108,13 @@ A source checkout includes an isolated, repeatable script that performs the same
 ./examples/quickstart.sh
 ```
 
-The script uses an external `age-keygen` to create a temporary demo identity, isolates HOME and Git configuration, verifies recovery in the clone, and then removes the identity, plaintext, and both temporary repositories. It does not read or modify a long-lived identity and does not print the recipient, private identity, or demo plaintext. To inspect the generated source and clone repositories, explicitly keep a successful workspace:
+The script uses `gitveil identity generate` with the pinned private age-keygen sidecar to create a temporary demo identity, isolates HOME and Git configuration, verifies recovery in the clone, and then removes the identity, plaintext, and both temporary repositories. It does not read or modify a long-lived identity and does not print the recipient, private identity, or demo plaintext. To inspect the generated source and clone repositories, explicitly keep a successful workspace:
 
 ```bash
 ./examples/quickstart.sh --keep-workspace
 ```
 
-A retained workspace contains an ephemeral private identity and demo plaintext. Use it only for local inspection, then delete the entire path printed by the script. The quickstart script is not included in release archives, which contain only the binary, private sidecar, and license files; archive users can follow the commands in this guide instead.
+A retained workspace contains an ephemeral private identity and demo plaintext. Use it only for local inspection, then delete the entire path printed by the script. The quickstart script is not included in release archives, which contain the Gitveil binary, both private sidecars, and license files; archive users can follow the commands in this guide instead.
 
 ## Add Gitveil to an existing repository
 

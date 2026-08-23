@@ -25,7 +25,7 @@ case "$#" in
     *) usage ;;
 esac
 
-for dependency in git age-keygen mktemp cmp stat uname; do
+for dependency in git mktemp cmp stat uname; do
     command -v "$dependency" >/dev/null 2>&1 || fail "$dependency is required"
 done
 command -v "$GITVEIL_BIN" >/dev/null 2>&1 || fail "gitveil is required"
@@ -47,7 +47,6 @@ HOME_DIR=$WORK_ROOT/home
 SOURCE_REPOSITORY=$WORK_ROOT/source
 CLONED_REPOSITORY=$WORK_ROOT/clone
 IDENTITY_FILE=$WORK_ROOT/identity.txt
-AGE_KEYGEN_STDERR=$WORK_ROOT/age-keygen.stderr
 GIT_LS_FILES_STDERR=$WORK_ROOT/git-ls-files.stderr
 mkdir -p "$HOME_DIR/xdg" "$SOURCE_REPOSITORY"
 : >"$HOME_DIR/gitconfig"
@@ -129,21 +128,10 @@ compare_plaintext() {
 }
 
 step "Generating an ephemeral age identity"
-if age-keygen -o "$IDENTITY_FILE" >/dev/null 2>"$AGE_KEYGEN_STDERR"; then
-    rm -f "$AGE_KEYGEN_STDERR"
-else
-    status=$?
-    cat "$AGE_KEYGEN_STDERR" >&2
-    exit "$status"
-fi
-chmod 600 "$IDENTITY_FILE"
-if RECIPIENT=$(age-keygen -y "$IDENTITY_FILE" 2>"$AGE_KEYGEN_STDERR"); then
-    rm -f "$AGE_KEYGEN_STDERR"
-else
-    status=$?
-    cat "$AGE_KEYGEN_STDERR" >&2
-    exit "$status"
-fi
+"$GITVEIL_BIN" identity generate --output "$IDENTITY_FILE" >/dev/null || \
+    fail "gitveil identity generation failed"
+RECIPIENT=$("$GITVEIL_BIN" identity recipients --identity "$IDENTITY_FILE") || \
+    fail "gitveil recipient derivation failed"
 [ -n "$RECIPIENT" ] || fail "public recipient derivation returned no recipient"
 export SOPS_AGE_KEY_FILE=$IDENTITY_FILE
 

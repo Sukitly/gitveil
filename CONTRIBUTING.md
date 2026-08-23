@@ -35,9 +35,10 @@ Preserve these invariants:
 - Unknown subprocess output is redacted by default.
 - Workspace paths are validated before descriptor-relative filesystem access; symlink and submodule escapes are rejected.
 - Git subprocesses are read-only. Gitveil does not modify the index, configuration, hooks, attributes, or Git state outside `.git/gitveil/`.
-- SOPS subprocess arguments never contain secret values.
+- SOPS and age-keygen subprocess arguments never contain secret values or private identity material.
 - Production code does not use `unwrap` or `expect` for external input, filesystem, Git, SOPS, process, or protocol results.
 - Do not use `unsafe` unless a platform security API has no safe wrapper; document the local invariant and add a platform test.
+- Identity generation uses the pinned official age-keygen sidecar, stages private material in owner-only storage, and never replaces an existing identity path.
 - Tests generate private identities and plaintext canaries at runtime instead of storing them in tracked fixtures.
 - Unchanged ciphertext and encrypted leaves are asserted byte-for-byte where stability is part of the contract.
 

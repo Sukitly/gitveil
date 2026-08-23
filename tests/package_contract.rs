@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use gitveil::sops::SOPS_VERSION;
-use support::{assert_success, command_output, sops_binary};
+use support::{age_keygen_binary, assert_success, command_output, sops_binary};
 
 fn installer_command() -> Command {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -17,7 +17,9 @@ fn installer_command() -> Command {
         .arg("--binary")
         .arg(assert_cmd::cargo::cargo_bin!("gitveil"))
         .arg("--sops-bin")
-        .arg(sops_binary());
+        .arg(sops_binary())
+        .arg("--age-keygen-bin")
+        .arg(age_keygen_binary());
     command
 }
 
@@ -36,6 +38,15 @@ fn assert_installed_layout(prefix: &Path) {
             PathBuf::from("share/licenses/gitveil/SOPS-NOTICE.txt"),
             0o644,
         ),
+        (
+            PathBuf::from("share/licenses/gitveil/AGE-BSD-3-Clause.txt"),
+            0o644,
+        ),
+        (
+            PathBuf::from("share/licenses/gitveil/AGE-NOTICE.txt"),
+            0o644,
+        ),
+        (PathBuf::from("libexec/gitveil/age-keygen"), 0o755),
     ];
     for (relative, expected_mode) in files {
         let installed = prefix.join(relative);
@@ -65,8 +76,60 @@ fn assert_installed_layout(prefix: &Path) {
         "SOPS notice must link the {version} source tree"
     );
 
+    let installed_age_license =
+        fs::read(prefix.join("share/licenses/gitveil/AGE-BSD-3-Clause.txt"))
+            .expect("installed age license");
+    let tracked_age_license =
+        fs::read(Path::new(env!("CARGO_MANIFEST_DIR")).join("licenses/AGE-BSD-3-Clause.txt"))
+            .expect("tracked age license");
+    assert_eq!(installed_age_license, tracked_age_license);
+
+    let age_notice = fs::read_to_string(prefix.join("share/licenses/gitveil/AGE-NOTICE.txt"))
+        .expect("installed age notice");
+    assert!(age_notice.contains(support::AGE_KEYGEN_VERSION));
+    assert!(age_notice.contains(&format!(
+        "FiloSottile/age/tree/v{}",
+        support::AGE_KEYGEN_VERSION
+    )));
+
     let output = command_output(Command::new(prefix.join("bin/gitveil")).arg("--version"));
     assert_success(output, "installed Gitveil version check");
+    let output =
+        command_output(Command::new(prefix.join("libexec/gitveil/age-keygen")).arg("--version"));
+    assert_success(output, "installed age-keygen version check");
+
+    let identity = prefix.join("identity-contract.txt");
+    let output = assert_success(
+        command_output(
+            Command::new(prefix.join("bin/gitveil"))
+                .env_remove("AGE_KEYGEN_BIN")
+                .args(["identity", "generate", "--output"])
+                .arg(&identity),
+        ),
+        "installed identity generation",
+    );
+    let private = fs::read(&identity).expect("installed generated identity");
+    assert!(
+        !output
+            .stdout
+            .windows(private.len())
+            .any(|value| value == private)
+    );
+    assert!(
+        !output
+            .stderr
+            .windows(private.len())
+            .any(|value| value == private)
+    );
+    assert_eq!(
+        fs::metadata(&identity)
+            .expect("installed identity metadata")
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600
+    );
+    fs::remove_file(identity).expect("remove installed generated identity");
 }
 
 #[test]
@@ -134,6 +197,8 @@ fn local_installer_rejects_a_directory_destination_without_partial_replacement()
         b"existing-sidecar"
     );
     assert!(prefix.join("bin/gitveil").is_dir());
+    assert!(!prefix.join("libexec/gitveil/age-keygen").exists());
+    assert!(!prefix.join("share/licenses/gitveil/LICENSE").exists());
 }
 
 #[test]
@@ -154,6 +219,8 @@ fn release_packaging_rejects_a_sidecar_with_the_wrong_checksum_without_an_archiv
             .arg(assert_cmd::cargo::cargo_bin!("gitveil"))
             .arg("--sops-bin")
             .arg(&fake_sops)
+            .arg("--age-keygen-bin")
+            .arg(age_keygen_binary())
             .arg("--output-dir")
             .arg(&output_dir),
     );
@@ -163,6 +230,40 @@ fn release_packaging_rejects_a_sidecar_with_the_wrong_checksum_without_an_archiv
     assert!(
         String::from_utf8_lossy(&output.stderr).contains("SOPS checksum mismatch"),
         "packaging must fail on the sidecar checksum"
+    );
+    assert!(
+        !output_dir.exists(),
+        "failed packaging must emit no archive"
+    );
+}
+
+#[test]
+fn release_packaging_rejects_an_age_keygen_with_the_wrong_checksum_without_an_archive() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let temporary = tempfile::tempdir().expect("package fixture");
+    let fake_age_keygen = temporary.path().join("age-keygen");
+    fs::write(&fake_age_keygen, b"not the official age-keygen artifact").expect("fake age-keygen");
+    let output_dir = temporary.path().join("output");
+
+    let output = command_output(
+        Command::new("python3")
+            .current_dir(root)
+            .env("PYTHONDONTWRITEBYTECODE", "1")
+            .arg("scripts/package-release.py")
+            .arg("--skip-build")
+            .arg("--binary")
+            .arg(assert_cmd::cargo::cargo_bin!("gitveil"))
+            .arg("--sops-bin")
+            .arg(sops_binary())
+            .arg("--age-keygen-bin")
+            .arg(&fake_age_keygen)
+            .arg("--output-dir")
+            .arg(&output_dir),
+    );
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("age-keygen checksum mismatch"),
+        "packaging must fail on the age-keygen checksum"
     );
     assert!(
         !output_dir.exists(),

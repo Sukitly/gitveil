@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fetch the checksum-pinned age-keygen binary used by quickstart tests."""
+"""Fetch the checksum-pinned age-keygen binary used by integration tests."""
 
 from __future__ import annotations
 

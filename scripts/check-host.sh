@@ -30,5 +30,6 @@ python3 scripts/package-release.py \
     --skip-build \
     --binary target/release/gitveil \
     --sops-bin "$SOPS_TEST_BIN" \
+    --age-keygen-bin "$AGE_KEYGEN_TEST_BIN" \
     --output-dir target/package-test
 git diff --check

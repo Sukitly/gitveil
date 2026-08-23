@@ -19,7 +19,7 @@ const PROCESS_TIMEOUT: Duration = Duration::from_secs(30);
 /// executes the fetched binary rather than trusting either declaration.
 pub const SOPS_COMPATIBILITY_BASELINE: (u64, u64, u64) = (3, 13, 2);
 
-/// The checksum-pinned age-keygen build used by the public quickstart contract.
+/// The checksum-pinned age-keygen build used by identity and packaging contracts.
 pub const AGE_KEYGEN_VERSION: &str = "1.3.1";
 
 fn test_tool_sops(version: (u64, u64, u64)) -> PathBuf {
@@ -36,7 +36,7 @@ pub fn sops_binary() -> PathBuf {
     test_tool_sops(SOPS_VERSION)
 }
 
-/// Resolves the checksum-pinned age-keygen executable used by quickstart tests.
+/// Resolves the checksum-pinned age-keygen executable used by integration tests.
 pub fn age_keygen_binary() -> PathBuf {
     if let Some(path) = std::env::var_os("AGE_KEYGEN_BIN") {
         return PathBuf::from(path);

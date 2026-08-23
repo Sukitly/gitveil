@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use zeroize::Zeroize;
 
 use super::classify::{SopsFailure, classify};
-use super::process::{ProcessOutput, SopsBinary, run_capture};
+use super::process::SopsBinary;
 use crate::config::SourceFormat;
 use crate::envelope::DecryptedEnvelope;
 use crate::error::{ErrorCategory, GitveilError, Result, SecretBytes};
@@ -18,6 +18,7 @@ use crate::recipient::{AgeRecipient, AgeRecipientPolicy};
 use crate::runtime::{
     ClosedRuntimeFile, EditorEndpoint, PrivateRuntime, receive_editor_payload, reject_editor_reuse,
 };
+use crate::runtime::{ProcessOutput, run_capture};
 
 pub const SOPS_VERSION: (u64, u64, u64) = (3, 13, 3);
 const PROCESS_TIMEOUT: Duration = Duration::from_mins(1);
@@ -72,8 +73,8 @@ impl SopsClient {
             .arg("--filename-override")
             .arg(managed_path.as_str())
             .arg(input.path());
-        let output =
-            run_capture(command, None, PROCESS_TIMEOUT).map_err(|_| SopsFailure::Execution)?;
+        let output = run_capture(command, None, PROCESS_TIMEOUT, "SOPS")
+            .map_err(|_| SopsFailure::Execution)?;
         if output.status.success() {
             Ok(output.stdout)
         } else {
@@ -104,7 +105,7 @@ impl SopsClient {
             .arg("--filename-override")
             .arg(managed_path.as_str())
             .arg(scaffold_file.path());
-        let output = run_capture(command, None, PROCESS_TIMEOUT)?;
+        let output = run_capture(command, None, PROCESS_TIMEOUT, "SOPS")?;
         let baseline = require_success(&output, "encrypt")?;
         self.edit(&baseline, desired, managed_path)
     }
@@ -155,7 +156,7 @@ impl SopsClient {
             .arg("--input-type")
             .arg("yaml")
             .arg(ciphertext.path());
-        let output = run_capture(command, None, PROCESS_TIMEOUT)?;
+        let output = run_capture(command, None, PROCESS_TIMEOUT, "SOPS")?;
         require_success(&output, "update keys")?;
         ciphertext.read_public()
     }
