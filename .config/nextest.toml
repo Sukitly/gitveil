@@ -1,0 +1,9 @@
+# Nextest runs every test in its own process, so serial_test's in-process
+# lock does not serialize across tests here. This group preserves the same
+# serialization the `#[serial]` markers provide under `cargo test`.
+[test-groups]
+ipc-endpoint = { max-threads = 1 }
+
+[[profile.default.overrides]]
+filter = 'binary(platform_runtime) & (test(authenticated_editor_ipc_transfers_payload_without_argv_or_filename_content) | test(editor_endpoint_rejects_a_second_connection) | test(editor_endpoint_fails_closed_on_a_wrong_token))'
+test-group = 'ipc-endpoint'

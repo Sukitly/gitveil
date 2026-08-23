@@ -1,0 +1,5 @@
+Gitveil release archives redistribute an unmodified official SOPS 3.13.3 executable.
+
+Project: getsops/sops
+Source code: https://github.com/getsops/sops/tree/v3.13.3
+License: Mozilla Public License 2.0 (see SOPS-MPL-2.0.txt)
