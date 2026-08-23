@@ -46,11 +46,7 @@ def check_links(file_path: Path) -> None:
             )
 
 
-markdown_files = sorted(ROOT.glob("docs/**/*.md"))
-for name in ("README.md", "CONTRIBUTING.md", "SECURITY.md"):
-    path = ROOT / name
-    if path.exists():
-        markdown_files.append(path)
+markdown_files = sorted(ROOT.glob("*.md")) + sorted(ROOT.glob("docs/**/*.md"))
 
 print(f"Checking relative links in {len(markdown_files)} public Markdown files...")
 for markdown_file in markdown_files:
