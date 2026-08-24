@@ -34,7 +34,7 @@ For a reproducible installation, replace `latest` with an immutable version:
 
 ```bash
 curl --proto '=https' --tlsv1.2 -LsSf \
-  https://github.com/Sukitly/gitveil/releases/download/v0.1.0/gitveil-installer.sh |
+  https://github.com/Sukitly/gitveil/releases/download/v0.2.0/gitveil-installer.sh |
   sh
 ```
 
@@ -42,7 +42,7 @@ To inspect and verify the installer before execution, download it and verify its
 
 ```bash
 curl --proto '=https' --tlsv1.2 -LO \
-  https://github.com/Sukitly/gitveil/releases/download/v0.1.0/gitveil-installer.sh
+  https://github.com/Sukitly/gitveil/releases/download/v0.2.0/gitveil-installer.sh
 gh attestation verify gitveil-installer.sh --repo Sukitly/gitveil
 sh gitveil-installer.sh
 ```
