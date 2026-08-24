@@ -51,7 +51,7 @@ Complete validation runs only in GitHub Actions. `.config/nextest.toml` defines 
 | `Linux` | Ubuntu | Native CLI, Git, SOPS, identity, filesystem, runtime, release build, and package validation |
 | `macOS` | macOS | The same native host suite on macOS |
 
-Every pull request and push to `main` runs all three checks on GitHub-hosted runners. CI uses no repository secrets and does not publish artifacts or releases. Do not add aggregate local gate scripts or a Docker replica of the hosted Linux runner.
+Every pull request and push to `main` runs all three checks on GitHub-hosted runners. The merge-gate workflow uses no repository secrets and never publishes releases. Release-related pull requests additionally exercise the four-target native archive workflow without requesting attestation or publication permissions. Exact version tags run the trusted attestation and draft-release jobs described in [`docs/releasing.md`](docs/releasing.md). Do not add aggregate local gate scripts or a Docker replica of the hosted Linux runner.
 
 ## Pull requests
 

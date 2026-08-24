@@ -13,21 +13,11 @@ import tarfile
 import tempfile
 
 from _lib.release_archive import (
+    RELEASE_FILES,
     archive_root_name,
     build_archive,
     package_version,
     validate_archive,
-)
-
-_INSTALL_MEMBERS = (
-    ("share/licenses/gitveil/LICENSE", 0o644),
-    ("share/licenses/gitveil/SOPS-MPL-2.0.txt", 0o644),
-    ("share/licenses/gitveil/SOPS-NOTICE.txt", 0o644),
-    ("share/licenses/gitveil/AGE-BSD-3-Clause.txt", 0o644),
-    ("share/licenses/gitveil/AGE-NOTICE.txt", 0o644),
-    ("libexec/gitveil/sops", 0o755),
-    ("libexec/gitveil/age-keygen", 0o755),
-    ("bin/gitveil", 0o755),
 )
 
 
@@ -40,7 +30,7 @@ def extract_payload(archive: Path, archive_root: str, staging: Path) -> Path:
     validate_archive(archive, archive_root)
     payload = staging / "payload"
     with tarfile.open(archive, "r:gz") as package:
-        for relative, mode in _INSTALL_MEMBERS:
+        for relative, mode in RELEASE_FILES:
             member_name = f"{archive_root}/{relative}"
             member = package.getmember(member_name)
             source = package.extractfile(member)
@@ -90,7 +80,7 @@ def path_exists(path: Path) -> bool:
 
 
 def commit_payload(payload: Path, prefix: Path, staging: Path) -> None:
-    destinations = [(payload / relative, prefix / relative) for relative, _ in _INSTALL_MEMBERS]
+    destinations = [(payload / relative, prefix / relative) for relative, _ in RELEASE_FILES]
     for _, destination in destinations:
         if is_directory_without_following_symlinks(destination):
             raise RuntimeError(f"install destination is a directory: {destination}")

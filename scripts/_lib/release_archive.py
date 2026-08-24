@@ -5,7 +5,7 @@ from __future__ import annotations
 import gzip
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import shutil
 import subprocess
 import tarfile
@@ -17,6 +17,17 @@ from .age_keygen_artifacts import fetch_verified as fetch_age_keygen
 from .age_keygen_artifacts import verify_binary as verify_age_keygen
 from .sops_artifacts import VERSION as SOPS_VERSION
 from .sops_artifacts import artifact_for, fetch_verified, verify
+
+RELEASE_FILES = (
+    ("share/licenses/gitveil/LICENSE", 0o644),
+    ("share/licenses/gitveil/SOPS-MPL-2.0.txt", 0o644),
+    ("share/licenses/gitveil/SOPS-NOTICE.txt", 0o644),
+    ("share/licenses/gitveil/AGE-BSD-3-Clause.txt", 0o644),
+    ("share/licenses/gitveil/AGE-NOTICE.txt", 0o644),
+    ("libexec/gitveil/sops", 0o755),
+    ("libexec/gitveil/age-keygen", 0o755),
+    ("bin/gitveil", 0o755),
+)
 
 
 def package_version(root: Path) -> str:
@@ -81,23 +92,13 @@ def write_archive(staging_root: Path, archive: Path) -> None:
 
 
 def expected_archive_members(archive_root: str) -> set[str]:
-    return {
-        f"{archive_root}",
-        f"{archive_root}/bin",
-        f"{archive_root}/bin/gitveil",
-        f"{archive_root}/libexec",
-        f"{archive_root}/libexec/gitveil",
-        f"{archive_root}/libexec/gitveil/sops",
-        f"{archive_root}/libexec/gitveil/age-keygen",
-        f"{archive_root}/share",
-        f"{archive_root}/share/licenses",
-        f"{archive_root}/share/licenses/gitveil",
-        f"{archive_root}/share/licenses/gitveil/LICENSE",
-        f"{archive_root}/share/licenses/gitveil/SOPS-MPL-2.0.txt",
-        f"{archive_root}/share/licenses/gitveil/SOPS-NOTICE.txt",
-        f"{archive_root}/share/licenses/gitveil/AGE-BSD-3-Clause.txt",
-        f"{archive_root}/share/licenses/gitveil/AGE-NOTICE.txt",
-    }
+    root = PurePosixPath(archive_root)
+    files = {root / relative for relative, _ in RELEASE_FILES}
+    directories = {root}
+    for file in files:
+        directories.update(file.parents)
+    directories.discard(PurePosixPath("."))
+    return {str(path) for path in files | directories}
 
 
 def validate_archive(archive: Path, archive_root: str) -> None:
@@ -112,25 +113,14 @@ def validate_archive(archive: Path, archive_root: str) -> None:
         extra = sorted(set(members) - expected)
         raise RuntimeError(f"invalid release archive layout; missing={missing}, extra={extra}")
 
-    files = {
-        f"{archive_root}/bin/gitveil",
-        f"{archive_root}/libexec/gitveil/sops",
-        f"{archive_root}/libexec/gitveil/age-keygen",
-        f"{archive_root}/share/licenses/gitveil/LICENSE",
-        f"{archive_root}/share/licenses/gitveil/SOPS-MPL-2.0.txt",
-        f"{archive_root}/share/licenses/gitveil/SOPS-NOTICE.txt",
-        f"{archive_root}/share/licenses/gitveil/AGE-BSD-3-Clause.txt",
-        f"{archive_root}/share/licenses/gitveil/AGE-NOTICE.txt",
-    }
+    files = {f"{archive_root}/{relative}" for relative, _ in RELEASE_FILES}
     for name, member in members.items():
         if name in files and not member.isfile():
             raise RuntimeError(f"release member is not a file: {name}")
         if name not in files and not member.isdir():
             raise RuntimeError(f"release member is not a directory: {name}")
     for executable in [
-        f"{archive_root}/bin/gitveil",
-        f"{archive_root}/libexec/gitveil/sops",
-        f"{archive_root}/libexec/gitveil/age-keygen",
+        f"{archive_root}/{relative}" for relative, mode in RELEASE_FILES if mode & 0o111
     ]:
         if members[executable].mode & 0o111 == 0:
             raise RuntimeError(f"release executable is not executable: {executable}")
