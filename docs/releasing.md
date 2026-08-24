@@ -22,27 +22,29 @@ Published releases are immutable. Their tag and assets cannot be replaced or del
 Repository settings enforce the publication boundary:
 
 - the `Protect release tags` ruleset prevents updates and deletion for `refs/tags/v*`;
-- the `release` environment accepts only `v*` tags and requires maintainer approval before the draft job receives write permission; and
-- GitHub release immutability locks the tag and all assets when the draft is published.
+- the `release` environment accepts only `v*` tags and requires maintainer approval before the publish job receives write permission; and
+- GitHub release immutability locks the tag and all assets at publication.
 
-## Prepare the version
+## One-time setup
 
-1. Update the package version in `Cargo.toml` through a pull request. Update `Cargo.lock` and user documentation when necessary.
-2. Merge only after the required `Core`, `Linux`, and `macOS` checks pass. Release-related pull requests also build all four native target archives through `.github/workflows/release.yml`.
-3. Confirm that the release commit is on `origin/main`, the working tree is clean, and the version has not already been released.
+Automatic tagging uses a dedicated credential because tags pushed with the default `GITHUB_TOKEN` do not trigger the tag-driven release workflow:
 
-The tag must exactly match the Cargo package version. Prerelease suffixes and moving branch references are rejected.
+1. Create a fine-grained personal access token scoped to this repository only, with `Contents: Read and write` and no other permission, and a bounded expiration.
+2. Store it as the `RELEASE_TOKEN` repository Actions secret.
+3. When it expires, generate a replacement and overwrite the secret; nothing else changes.
 
-## Create the draft release
+## Standard release
 
-From an up-to-date `main` checkout, create and push an annotated tag:
+A release is one command and two clicks:
 
 ```bash
-git switch main
-git pull --ff-only origin main
-git tag -a v0.1.0 -m "Gitveil v0.1.0"
-git push origin v0.1.0
+scripts/prepare-release.py patch   # or minor / major
 ```
+
+The script verifies a clean, up-to-date `main`, computes the next version, updates `Cargo.toml`, `Cargo.lock`, and the pinned installer links in `README.md`, and opens a pull request from a `release/v<version>` branch. Because the pull request touches `Cargo.toml`, the release workflow also builds all four native target archives as a pre-release rehearsal.
+
+1. **Merge the release pull request** after the required `Core`, `Linux`, and `macOS` checks and the rehearsal pass. On merge, `create-release-tag.yml` validates that the branch name matches the Cargo version, tags the merge commit `v<version>`, and deletes the release branch. The tag push starts the release workflow.
+2. **Approve the `release` environment** in the workflow run once the build, assembly, and attestation jobs finish. Approval is the publication decision: the publish job re-verifies the six-asset contract against the draft and then publishes it. There is no separate manual publish step.
 
 The tag-triggered release workflow:
 
@@ -53,32 +55,33 @@ The tag-triggered release workflow:
 5. transfers all four archives with per-archive checksums;
 6. generates the version-pinned installer and aggregate `SHA256SUMS` manifest;
 7. attests all six final assets;
-8. waits for approval of the `release` environment; and
-9. creates or updates a draft GitHub Release with generated release notes.
+8. creates a draft release with generated release notes;
+9. waits for approval of the `release` environment; and
+10. verifies the draft still matches the six-asset contract and publishes it.
 
-The workflow refuses to replace assets on a published release.
+The workflow refuses to touch a release that is already published.
 
-## Verify and publish
+## Inspecting before approval
 
-After the workflow succeeds, inspect the draft release before publishing it:
+The draft and its generated notes are visible on the Releases page before the environment is approved. For an independent check on a trusted machine, download the draft assets and verify them:
 
 ```bash
 rm -rf release-review
 mkdir release-review
-gh release download v0.1.0 --repo Sukitly/gitveil --dir release-review
-(cd release-review && sha256sum --check SHA256SUMS)
+gh release download v<version> --repo Sukitly/gitveil --dir release-review
+(cd release-review && shasum -a 256 --check SHA256SUMS)
 for asset in release-review/*; do
   gh attestation verify "$asset" --repo Sukitly/gitveil
 done
 ```
 
-On macOS, use `shasum -a 256 --check SHA256SUMS` when `sha256sum` is unavailable. Confirm that the draft contains exactly the six declared assets, all attestations verify, generated notes describe the intended changes, and every release workflow job has no unresolved annotation.
-
-Publish the draft through the GitHub Releases interface. Publication makes the release and its assets immutable and updates the `releases/latest` installer URL.
+Release notes remain editable after publication; assets and the tag do not.
 
 ## Failed releases
 
 - Retry a failed workflow job when the failure is transient and no artifact input changed.
 - Never move or reuse a release tag after artifacts have been published.
 - If source, dependencies, packaging, checksums, or installer behavior must change, fix them through a pull request and publish a new patch version.
+- If `create-release-tag.yml` fails because `RELEASE_TOKEN` expired, refresh the secret and re-run the job; the tag step is idempotent.
+- Manual fallback: the automated path is equivalent to tagging by hand. From an up-to-date `main` checkout of the release commit, `git tag -a v<version> -m "Gitveil v<version>" && git push origin v<version>` starts the same tag-triggered workflow.
 - For a security release, coordinate through GitHub Private Vulnerability Reporting and publish the associated security advisory when disclosure is appropriate.
