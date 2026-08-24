@@ -273,9 +273,6 @@ jobs:
       - attest
     runs-on: ubuntu-latest
     timeout-minutes: 15
-    environment:
-      name: release
-      url: ${{ steps.release.outputs.url }}
     permissions:
       contents: write
     steps:
@@ -291,7 +288,6 @@ jobs:
           (cd release-assets && sha256sum --check SHA256SUMS)
 
       - name: Create or update the draft release
-        id: release
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ github.ref_name }}
@@ -313,5 +309,62 @@ jobs:
               --generate-notes \
               --title "Gitveil $RELEASE_TAG"
           fi
+
+  publish:
+    name: Publish release
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+    needs:
+      - validate
+      - draft
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment:
+      name: release
+      url: ${{ steps.publish.outputs.url }}
+    permissions:
+      contents: write
+    steps:
+      # Draft assets stay mutable until publication, so the facts the
+      # approval relies on are re-derived here, inside the gate: the six
+      # assets are downloaded and verified byte-for-byte against SHA256SUMS
+      # and their build attestations before anything goes live.
+      - name: Verify the draft release before publication
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+          VERSION: ${{ needs.validate.outputs.version }}
+        run: |
+          state="$(gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft)"
+          if [[ "$state" != "true" ]]; then
+            echo "release $RELEASE_TAG is not a draft; refusing to touch a published release" >&2
+            exit 1
+          fi
+          mkdir release-review
+          gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --dir release-review
+          mapfile -t assets < <(cd release-review && find . -maxdepth 1 -type f -exec basename {} \; | sort)
+          expected=$(printf '%s\n' \
+            "SHA256SUMS" \
+            "gitveil-installer.sh" \
+            "gitveil-v$VERSION-darwin-aarch64.tar.gz" \
+            "gitveil-v$VERSION-darwin-x86_64.tar.gz" \
+            "gitveil-v$VERSION-linux-aarch64.tar.gz" \
+            "gitveil-v$VERSION-linux-x86_64.tar.gz" | sort)
+          if [[ "$(printf '%s\n' "${assets[@]}")" != "$expected" ]]; then
+            echo "draft assets do not match the six-asset release contract" >&2
+            printf 'actual:\n%s\n' "${assets[@]}" >&2
+            exit 1
+          fi
+          (cd release-review && sha256sum --check SHA256SUMS)
+          for asset in release-review/*; do
+            gh attestation verify "$asset" --repo "$GITHUB_REPOSITORY"
+          done
+
+      - name: Publish the release
+        id: publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          gh release edit "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --draft=false --latest
           gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json url --jq '"url=" + .url' \
             >> "$GITHUB_OUTPUT"

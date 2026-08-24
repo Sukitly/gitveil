@@ -15,7 +15,7 @@ GitHub Actions installs the pinned `cargo-nextest` and `cargo-deny` versions use
 
 ## Making changes
 
-Create a branch from the latest `main`. Keep commits focused and use English for commit messages, pull request titles, descriptions, code comments, tests, and documentation.
+Create a branch from the latest `main`. Keep commits focused and use English for commit messages, pull request titles, descriptions, code comments, tests, and documentation. Branch names starting with `release/` are reserved for `scripts/prepare-release.py`: merging such a branch triggers the automated release tagging described in [`docs/releasing.md`](docs/releasing.md), so never use that prefix for ordinary work.
 
 When changing core behavior, add or update the relevant test first and confirm that it fails for the expected reason before implementing the change. Pure decisions belong in pure modules; filesystem, process, Git, SOPS, environment, clock, and random effects stay at explicit boundaries.
 
@@ -51,7 +51,7 @@ Complete validation runs only in GitHub Actions. `.config/nextest.toml` defines 
 | `Linux` | Ubuntu | Native CLI, Git, SOPS, identity, filesystem, runtime, release build, and package validation |
 | `macOS` | macOS | The same native host suite on macOS |
 
-Every pull request and push to `main` runs all three checks on GitHub-hosted runners. The merge-gate workflow uses no repository secrets and never publishes releases. Release-related pull requests additionally exercise the four-target native archive workflow without requesting attestation or publication permissions. Exact version tags run the trusted attestation and draft-release jobs described in [`docs/releasing.md`](docs/releasing.md). Do not add aggregate local gate scripts or a Docker replica of the hosted Linux runner.
+Every pull request and push to `main` runs all three checks on GitHub-hosted runners. The merge-gate workflow uses no repository secrets and never publishes releases. Release-related pull requests additionally exercise the four-target native archive workflow without requesting attestation or publication permissions. Merging a `release/v*` pull request tags the merge commit, and the exact version tag runs the trusted attestation, draft, and approval-gated publish jobs described in [`docs/releasing.md`](docs/releasing.md). Do not add aggregate local gate scripts or a Docker replica of the hosted Linux runner.
 
 ## Pull requests
 
