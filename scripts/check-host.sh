@@ -19,6 +19,7 @@ fi
 
 SOPS_TEST_BIN=$(python3 scripts/fetch-test-sops.py)
 AGE_KEYGEN_TEST_BIN=$(python3 scripts/fetch-test-age.py)
+AGE_KEYGEN_TEST_ARCHIVE=$(python3 scripts/fetch-test-age.py --print-archive)
 cargo fmt --all -- --check
 python3 scripts/check-architecture.py
 python3 scripts/check-docs.py
@@ -30,5 +31,7 @@ python3 scripts/package-release.py \
     --skip-build \
     --binary target/release/gitveil \
     --sops-bin "$SOPS_TEST_BIN" \
+    --age-keygen-bin "$AGE_KEYGEN_TEST_BIN" \
+    --age-keygen-archive "$AGE_KEYGEN_TEST_ARCHIVE" \
     --output-dir target/package-test
 git diff --check

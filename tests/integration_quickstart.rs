@@ -1,7 +1,7 @@
 pub mod support;
 
 use std::fs;
-use std::os::unix::fs::{PermissionsExt, symlink};
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::time::Duration;
@@ -28,8 +28,6 @@ impl QuickstartFixture {
         let workspaces = root.path().join("workspaces");
         fs::create_dir(&tools).expect("create tool directory");
         fs::create_dir(&workspaces).expect("create workspace parent");
-        symlink(age_keygen_binary(), tools.join("age-keygen"))
-            .expect("link checksum-pinned age-keygen");
         Self {
             root,
             tools,
@@ -53,6 +51,7 @@ impl QuickstartFixture {
             .env("PATH", path)
             .env("GITVEIL_BIN", &self.gitveil)
             .env("SOPS_BIN", sops_binary())
+            .env("AGE_KEYGEN_BIN", age_keygen_binary())
             .env("TMPDIR", &self.workspaces)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -301,20 +300,37 @@ fn executable_example_preserves_diagnostics_redacts_secrets_and_cleans_up_on_fai
 }
 
 #[test]
-fn executable_example_preserves_age_keygen_failure_diagnostics_and_cleans_up() {
+fn executable_example_redacts_age_keygen_failure_and_cleans_up() {
     let fixture = QuickstartFixture::new();
-    fixture.replace_tool(
-        "age-keygen",
-        b"#!/bin/sh\nprintf '%s\\n' 'age-keygen: permission denied writing identity' >&2\nexit 9\n",
+    let failing_age_keygen = fixture.root.path().join("failing-age-keygen");
+    fs::write(
+        &failing_age_keygen,
+        b"#!/bin/sh\nif [ \"${1:-}\" = \"--version\" ]; then\n  printf 'v1.3.1\\n'\n  exit 0\nfi\nprintf '%s\\n' 'AGE-SECRET-KEY-FAILURE-CANARY' >&2\nexit 9\n",
+    )
+    .expect("write failing age-keygen");
+    fs::set_permissions(&failing_age_keygen, fs::Permissions::from_mode(0o755))
+        .expect("make failing age-keygen executable");
+    let mut command = fixture.command();
+    command.env("AGE_KEYGEN_BIN", failing_age_keygen);
+    let output = child_output_with_timeout(
+        command.spawn().expect("start failing quickstart"),
+        QUICKSTART_TIMEOUT,
     );
-    let output = fixture.run(&[]);
 
     assert!(!output.status.success());
     assert!(contains(
         &output.stderr,
-        b"age-keygen: permission denied writing identity"
+        b"age-keygen identity generation failed with exit code 9"
     ));
-    assert_no_secret_output(&output, &[b"AGE-SECRET-KEY-", b"age1", PLAINTEXT_CANARY]);
+    assert_no_secret_output(
+        &output,
+        &[
+            b"AGE-SECRET-KEY-",
+            b"FAILURE-CANARY",
+            b"age1",
+            PLAINTEXT_CANARY,
+        ],
+    );
     fixture.assert_no_workspaces();
 }
 
@@ -351,13 +367,27 @@ fn executable_example_does_not_treat_a_git_ignore_failure_as_not_ignored() {
 }
 
 #[test]
-fn executable_example_reports_missing_age_keygen_before_creating_a_workspace() {
+fn executable_example_cleans_up_its_workspace_when_age_keygen_cannot_start() {
     let fixture = QuickstartFixture::new();
-    fs::remove_file(fixture.tools.join("age-keygen")).expect("remove age-keygen test link");
-    let output = fixture.run(&[]);
+    let mut command = fixture.command();
+    command.env(
+        "AGE_KEYGEN_BIN",
+        fixture.root.path().join("missing-age-keygen"),
+    );
+    let output = child_output_with_timeout(
+        command.spawn().expect("start dependency failure"),
+        QUICKSTART_TIMEOUT,
+    );
 
     assert!(!output.status.success());
-    assert!(contains(&output.stderr, b"age-keygen is required"));
+    assert!(contains(
+        &output.stderr,
+        b"AGE_KEYGEN_BIN does not point to a file"
+    ));
+    assert!(contains(
+        &output.stderr,
+        b"Gitveil quickstart failed: gitveil identity generation failed"
+    ));
     assert_no_secret_output(&output, &[b"AGE-SECRET-KEY-", b"age1", PLAINTEXT_CANARY]);
     fixture.assert_no_workspaces();
 }

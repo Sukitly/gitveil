@@ -30,11 +30,14 @@ PURE_FILES = [
     "src/resolve/plan.rs",
     "src/verify/policy.rs",
     "src/sops/classify.rs",
+    "src/age/classify.rs",
 ]
 FORBIDDEN = {
+    r"\bcrate::age\b": "age adapter",
     r"\bcrate::git\b": "Git adapter",
     r"\bcrate::sops\b": "SOPS adapter",
     r"\bcrate::runtime\b": "runtime adapter",
+    r"\bcrate::\s*\{[^}]*\bage\b": "age adapter",
     r"\bcrate::\s*\{[^}]*\bgit\b": "Git adapter",
     r"\bcrate::\s*\{[^}]*\bsops\b": "SOPS adapter",
     r"\bcrate::\s*\{[^}]*\bruntime\b": "runtime adapter",

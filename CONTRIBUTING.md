@@ -35,9 +35,10 @@ Preserve these invariants:
 - Unknown subprocess output is redacted by default.
 - Workspace paths are validated before descriptor-relative filesystem access; symlink and submodule escapes are rejected.
 - Git subprocesses are read-only. Gitveil does not modify the index, configuration, hooks, attributes, or Git state outside `.git/gitveil/`.
-- SOPS subprocess arguments never contain secret values.
+- SOPS and age-keygen subprocess arguments never contain secret values or private identity material.
 - Production code does not use `unwrap` or `expect` for external input, filesystem, Git, SOPS, process, or protocol results.
 - Do not use `unsafe` unless a platform security API has no safe wrapper; document the local invariant and add a platform test.
+- Identity generation uses the pinned official age-keygen sidecar, stages private material in owner-only storage, and never replaces an existing identity path.
 - Tests generate private identities and plaintext canaries at runtime instead of storing them in tracked fixtures.
 - Unchanged ciphertext and encrypted leaves are asserted byte-for-byte where stability is part of the contract.
 
@@ -61,7 +62,7 @@ On macOS, run both through the unified gate before requesting review:
 ./scripts/check-all.sh
 ```
 
-The gates cover formatting, architecture boundaries, public documentation links, Clippy, unit and integration tests, dependency policy, release builds, and native archive validation. Integration tests use real Git and checksum-pinned SOPS executables. Initial cold runs download dependencies and build artifacts and may take substantially longer than warm runs.
+The gates cover formatting, architecture boundaries, public documentation links, Clippy, unit and integration tests, dependency policy, release builds, and native archive validation. Integration tests use real Git and checksum-pinned SOPS and age-keygen executables. Initial cold runs download dependencies and build artifacts and may take substantially longer than warm runs.
 
 GitHub Actions runs `scripts/check-host.sh` natively on Linux and macOS for every pull request and push to `main`. CI uses no repository secrets and does not publish artifacts or releases.
 

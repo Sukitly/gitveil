@@ -34,7 +34,8 @@ Reports are especially valuable when they involve:
 - Unauthorized decryption after recipient removal or incorrect recipient-policy enforcement.
 - Failure to rotate the data key when a recipient is removed.
 - Modification of the Git index, configuration, hooks, attributes, or state outside `.git/gitveil/`.
-- SOPS sidecar substitution, checksum bypass, version confusion, or repository configuration injection.
+- SOPS or age-keygen sidecar substitution, checksum bypass, version confusion, or repository configuration injection.
+- Identity generation that overwrites an existing path, leaves partial private material, uses unsafe permissions, or reveals a private identity.
 - Local IPC authentication, permissions, process cleanup, or lock isolation failures.
 - Ciphertext integrity, MAC, merge, or rollback behavior that can expose or silently replace secret data.
 

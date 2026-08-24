@@ -12,7 +12,7 @@ ARG SOPS_SHA256
 ARG SOPS_BASELINE_VERSION=3.13.2
 ARG SOPS_BASELINE_ARTIFACT
 ARG SOPS_BASELINE_SHA256
-# age-keygen is a test-only provisioning dependency for the public quickstart.
+# age-keygen is the pinned identity sidecar used by integration and packaging tests.
 ARG AGE_VERSION=1.3.1
 ARG AGE_ARTIFACT
 ARG AGE_SHA256
@@ -20,7 +20,8 @@ ARG NEXTEST_VERSION=0.9.140
 ENV SOPS_BIN=/usr/local/bin/sops \
     SOPS_BASELINE_BIN=/usr/local/bin/sops-baseline \
     SOPS_DISABLE_VERSION_CHECK=1 \
-    AGE_KEYGEN_BIN=/usr/local/bin/age-keygen
+    AGE_KEYGEN_BIN=/usr/local/bin/age-keygen \
+    AGE_KEYGEN_ARCHIVE=/usr/local/share/gitveil-test/age.tar.gz
 
 RUN apt-get update \
     && apt-get install --yes --no-install-recommends ca-certificates curl git python3 \
@@ -61,6 +62,8 @@ RUN set -eu; \
     echo "${AGE_SHA256}  /tmp/age.tar.gz" | sha256sum --check --strict; \
     tar -xzf /tmp/age.tar.gz -C /tmp age/age-keygen; \
     install -m 0755 /tmp/age/age-keygen /usr/local/bin/age-keygen; \
+    mkdir -p /usr/local/share/gitveil-test; \
+    install -m 0644 /tmp/age.tar.gz /usr/local/share/gitveil-test/age.tar.gz; \
     rm -rf /tmp/age /tmp/age.tar.gz; \
     age-keygen --version
 

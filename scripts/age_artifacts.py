@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Checksum-pinned official age artifacts used by the quickstart test contract."""
+"""Pinned official age-keygen artifacts shared by tests and release packaging."""
 
 from __future__ import annotations
 
@@ -129,6 +129,30 @@ def fetch_archive(destination: Path, artifact: Artifact) -> Path:
     return destination
 
 
+def age_keygen_digest(archive: Path) -> str:
+    with tarfile.open(archive, "r:gz") as package:
+        try:
+            member = package.getmember("age/age-keygen")
+        except KeyError as error:
+            raise ValueError("official age archive does not contain age/age-keygen") from error
+        if not member.isfile():
+            raise ValueError("official age archive age/age-keygen is not a file")
+        source = package.extractfile(member)
+        if source is None:
+            raise ValueError("official age archive age/age-keygen cannot be read")
+        return hashlib.sha256(source.read()).hexdigest()
+
+
+def verify_binary(path: Path, archive: Path, artifact: Artifact) -> None:
+    verify_archive(archive, artifact)
+    expected = age_keygen_digest(archive)
+    actual = digest(path)
+    if actual != expected:
+        raise ValueError(
+            f"age-keygen checksum mismatch: expected {expected}, got {actual}"
+        )
+
+
 def extract_verified_age_keygen(archive: Path, destination: Path) -> Path:
     with tarfile.open(archive, "r:gz") as package:
         try:
@@ -156,18 +180,16 @@ def extract_verified_age_keygen(archive: Path, destination: Path) -> Path:
 
 def fetch_verified(destination: Path, artifact: Artifact) -> Path:
     archive = fetch_archive(destination.parent / artifact.filename, artifact)
-    with tarfile.open(archive, "r:gz") as package:
-        source = package.extractfile("age/age-keygen")
-        if source is None:
-            raise ValueError("official age archive age/age-keygen cannot be read")
-        expected_binary_digest = hashlib.sha256(source.read()).hexdigest()
+    expected_binary_digest = age_keygen_digest(archive)
     if destination.is_file() and digest(destination) == expected_binary_digest:
         destination.chmod(destination.stat().st_mode | stat.S_IXUSR)
         return destination
     extracted = extract_verified_age_keygen(archive, destination)
-    if digest(extracted) != expected_binary_digest:
+    try:
+        verify_binary(extracted, archive, artifact)
+    except ValueError:
         extracted.unlink(missing_ok=True)
-        raise ValueError("extracted age-keygen does not match the verified archive")
+        raise
     return extracted
 
 

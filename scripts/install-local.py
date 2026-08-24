@@ -18,7 +18,10 @@ _INSTALL_MEMBERS = (
     ("share/licenses/gitveil/LICENSE", 0o644),
     ("share/licenses/gitveil/SOPS-MPL-2.0.txt", 0o644),
     ("share/licenses/gitveil/SOPS-NOTICE.txt", 0o644),
+    ("share/licenses/gitveil/AGE-BSD-3-Clause.txt", 0o644),
+    ("share/licenses/gitveil/AGE-NOTICE.txt", 0o644),
     ("libexec/gitveil/sops", 0o755),
+    ("libexec/gitveil/age-keygen", 0o755),
     ("bin/gitveil", 0o755),
 )
 
@@ -51,6 +54,7 @@ def extract_payload(archive: Path, archive_root: str, staging: Path) -> Path:
 def verify_payload(payload: Path) -> None:
     commands = [
         [str(payload / "libexec/gitveil/sops"), "--disable-version-check", "--version"],
+        [str(payload / "libexec/gitveil/age-keygen"), "--version"],
         [str(payload / "bin/gitveil"), "--version"],
     ]
     for command in commands:
@@ -125,7 +129,7 @@ def install_archive(archive: Path, archive_root: str, prefix: Path) -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Build and install Gitveil with its pinned private SOPS sidecar."
+        description="Build and install Gitveil with its pinned private sidecars."
     )
     parser.add_argument(
         "--prefix",
@@ -134,6 +138,8 @@ def main() -> int:
     )
     parser.add_argument("--binary", type=Path, help=argparse.SUPPRESS)
     parser.add_argument("--sops-bin", type=Path, help=argparse.SUPPRESS)
+    parser.add_argument("--age-keygen-bin", type=Path, help=argparse.SUPPRESS)
+    parser.add_argument("--age-keygen-archive", type=Path, help=argparse.SUPPRESS)
     parser.add_argument("--skip-build", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
 
@@ -142,11 +148,24 @@ def main() -> int:
         subprocess.run(["cargo", "build", "--release", "--locked"], cwd=root, check=True)
     binary = (args.binary or root / "target" / "release" / "gitveil").resolve()
     sops_binary = args.sops_bin.resolve() if args.sops_bin else None
+    age_keygen_binary = (
+        args.age_keygen_bin.resolve() if args.age_keygen_bin else None
+    )
+    age_keygen_archive = (
+        args.age_keygen_archive.resolve() if args.age_keygen_archive else None
+    )
     prefix = (args.prefix or default_prefix()).expanduser().resolve()
     archive_root = archive_root_name(root)
 
     with tempfile.TemporaryDirectory(prefix="gitveil-local-package-") as temporary:
-        archive = build_archive(root, Path(temporary), binary, sops_binary)
+        archive = build_archive(
+            root,
+            Path(temporary),
+            binary,
+            sops_binary,
+            age_keygen_binary,
+            age_keygen_archive,
+        )
         install_archive(archive, archive_root, prefix)
 
     print(f"Installed Gitveil {package_version(root)} to {prefix}")

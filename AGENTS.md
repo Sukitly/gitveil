@@ -18,7 +18,7 @@ Inspect the existing implementation and tests before proposing changes. Do not i
 - Gitveil is one Rust 2024 package with a library and a thin binary.
 - Supported production hosts are macOS and Linux.
 - The Rust version is pinned in `rust-toolchain.toml`.
-- The compatible SOPS build and artifact checksums are declared in `scripts/sops_artifacts.py`.
+- Compatible SOPS and age-keygen builds and artifact checksums are declared in `scripts/sops_artifacts.py` and `scripts/age_artifacts.py`.
 - `Cargo.toml` intentionally has `publish = false`; do not publish the crate or create releases unless explicitly requested.
 - Keep all tracked text, code comments, tests, commit messages, and pull request content in English.
 - Do not add private keys, plaintext secrets, local absolute paths, generated build output, unpublished planning material, or tool transcripts.
@@ -32,8 +32,8 @@ Keep pure policy and transformation code separate from external effects.
 - `scripts/check-architecture.py` is the executable declaration of modules that belong to the functional core. Add new pure modules to that declaration rather than bypassing the check.
 - `src/source/` owns typed and lossless source parsing and rendering.
 - `src/semantic/` owns pure semantic diff and merge behavior.
-- `src/git/`, `src/sops/`, and `src/runtime/` contain external adapters.
-- Top-level feature modules such as `configure`, `seal`, `open`, `status`, `verify`, and `resolve` orchestrate pure decisions and explicit effects.
+- `src/git/`, `src/sops/`, `src/age.rs`, and `src/runtime/` contain external adapters.
+- Top-level feature modules such as `identity`, `configure`, `seal`, `open`, `status`, `verify`, and `resolve` orchestrate pure decisions and explicit effects.
 - `src/main.rs` remains a thin CLI entry point; reusable behavior belongs in the library.
 
 Choose the correct abstraction rather than the smallest diff. Do not duplicate policy in an orchestrator when it belongs in a pure model or plan.
@@ -45,10 +45,10 @@ Treat these as product contracts:
 - Secret values, private identities, data keys, and decrypted comments must not enter argv, Git metadata, logs, errors, reports, baselines, or tracked fixtures.
 - Secret-bearing values must not gain `Debug` or `Display` implementations that can reveal their contents.
 - Unknown Git or SOPS stderr is redacted by default. Preserve typed error categories instead of forwarding arbitrary subprocess output.
-- SOPS subprocess arguments never contain secret values.
+- SOPS and age-keygen subprocess arguments never contain secret values or private identity material.
 - Git subprocesses use read-only plumbing. Gitveil never modifies the index, Git configuration, hooks, attributes, or Git state outside `.git/gitveil/`.
 - Workspace paths are validated before descriptor-relative filesystem access. Symlink and submodule escapes must fail closed.
-- Owner-only permissions are required for plaintext, runtime directories, temporary files, local IPC, and installed private sidecars where applicable.
+- Owner-only permissions are required for plaintext, generated identities, identity staging, runtime directories, temporary files, local IPC, and installed private sidecars where applicable.
 - Production code must not use `unwrap` or `expect` for external input, filesystem, Git, SOPS, process, or protocol results.
 - Do not add `unsafe` code. If a platform security API has no safe wrapper, obtain maintainer approval, document the local invariant, and add platform coverage first.
 - Do not weaken a security assertion to accommodate nondeterministic fixture behavior. Isolate the external source of nondeterminism instead.
@@ -72,7 +72,7 @@ Match the test level to the contract:
 
 - Keep pure decision tests colocated with their modules.
 - Use contract tests for public domain behavior.
-- Use real ephemeral repositories and real pinned SOPS executables for Git, SOPS, filesystem, process, and runtime integration behavior.
+- Use real ephemeral repositories and real pinned SOPS and age-keygen executables for Git, SOPS, identity, filesystem, process, and runtime integration behavior.
 - Inject failures only at external boundaries that cannot be triggered reliably; do not mock the semantic core.
 - Generate unique age identities and plaintext canaries at test time. Never add a private identity or plaintext secret fixture.
 - Assert unchanged ciphertext and encrypted leaves byte-for-byte where stability is part of the contract.

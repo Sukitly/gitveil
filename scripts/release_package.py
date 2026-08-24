@@ -12,6 +12,10 @@ import subprocess
 import tarfile
 import tempfile
 
+from age_artifacts import VERSION as AGE_VERSION
+from age_artifacts import artifact_for as age_artifact_for
+from age_artifacts import fetch_verified as fetch_age_keygen
+from age_artifacts import verify_binary as verify_age_keygen
 from sops_artifacts import VERSION as SOPS_VERSION
 from sops_artifacts import artifact_for, fetch_verified, verify
 
@@ -85,12 +89,15 @@ def expected_archive_members(archive_root: str) -> set[str]:
         f"{archive_root}/libexec",
         f"{archive_root}/libexec/gitveil",
         f"{archive_root}/libexec/gitveil/sops",
+        f"{archive_root}/libexec/gitveil/age-keygen",
         f"{archive_root}/share",
         f"{archive_root}/share/licenses",
         f"{archive_root}/share/licenses/gitveil",
         f"{archive_root}/share/licenses/gitveil/LICENSE",
         f"{archive_root}/share/licenses/gitveil/SOPS-MPL-2.0.txt",
         f"{archive_root}/share/licenses/gitveil/SOPS-NOTICE.txt",
+        f"{archive_root}/share/licenses/gitveil/AGE-BSD-3-Clause.txt",
+        f"{archive_root}/share/licenses/gitveil/AGE-NOTICE.txt",
     }
 
 
@@ -109,16 +116,23 @@ def validate_archive(archive: Path, archive_root: str) -> None:
     files = {
         f"{archive_root}/bin/gitveil",
         f"{archive_root}/libexec/gitveil/sops",
+        f"{archive_root}/libexec/gitveil/age-keygen",
         f"{archive_root}/share/licenses/gitveil/LICENSE",
         f"{archive_root}/share/licenses/gitveil/SOPS-MPL-2.0.txt",
         f"{archive_root}/share/licenses/gitveil/SOPS-NOTICE.txt",
+        f"{archive_root}/share/licenses/gitveil/AGE-BSD-3-Clause.txt",
+        f"{archive_root}/share/licenses/gitveil/AGE-NOTICE.txt",
     }
     for name, member in members.items():
         if name in files and not member.isfile():
             raise RuntimeError(f"release member is not a file: {name}")
         if name not in files and not member.isdir():
             raise RuntimeError(f"release member is not a directory: {name}")
-    for executable in [f"{archive_root}/bin/gitveil", f"{archive_root}/libexec/gitveil/sops"]:
+    for executable in [
+        f"{archive_root}/bin/gitveil",
+        f"{archive_root}/libexec/gitveil/sops",
+        f"{archive_root}/libexec/gitveil/age-keygen",
+    ]:
         if members[executable].mode & 0o111 == 0:
             raise RuntimeError(f"release executable is not executable: {executable}")
 
@@ -128,6 +142,8 @@ def build_archive(
     output_dir: Path,
     binary: Path,
     sops_binary: Path | None,
+    age_keygen_binary: Path | None,
+    age_keygen_archive: Path | None,
 ) -> Path:
     artifact = artifact_for()
     if not binary.is_file():
@@ -140,12 +156,28 @@ def build_archive(
     else:
         verify(sops_binary, artifact)
 
+    age_artifact = age_artifact_for()
+    age_tools = root / "target" / "release-tools" / f"age-{AGE_VERSION}"
+    if age_keygen_binary is None:
+        if age_keygen_archive is not None:
+            raise RuntimeError(
+                "--age-keygen-bin is required with --age-keygen-archive"
+            )
+        age_keygen_binary = fetch_age_keygen(age_tools / "age-keygen", age_artifact)
+    else:
+        if age_keygen_archive is None:
+            raise RuntimeError(
+                "--age-keygen-archive is required with --age-keygen-bin"
+            )
+        verify_age_keygen(age_keygen_binary, age_keygen_archive, age_artifact)
+
     archive_root = archive_root_name(root)
     with tempfile.TemporaryDirectory(prefix="gitveil-package-") as temporary:
         staging_root = Path(temporary) / archive_root
         destinations = {
             binary: staging_root / "bin" / "gitveil",
             sops_binary: staging_root / "libexec" / "gitveil" / "sops",
+            age_keygen_binary: staging_root / "libexec" / "gitveil" / "age-keygen",
             root / "LICENSE": staging_root / "share" / "licenses" / "gitveil" / "LICENSE",
             root / "licenses" / "SOPS-MPL-2.0.txt": staging_root
             / "share"
@@ -157,6 +189,16 @@ def build_archive(
             / "licenses"
             / "gitveil"
             / "SOPS-NOTICE.txt",
+            root / "licenses" / "AGE-BSD-3-Clause.txt": staging_root
+            / "share"
+            / "licenses"
+            / "gitveil"
+            / "AGE-BSD-3-Clause.txt",
+            root / "licenses" / "AGE-NOTICE.txt": staging_root
+            / "share"
+            / "licenses"
+            / "gitveil"
+            / "AGE-NOTICE.txt",
         }
         for source, destination in destinations.items():
             if not source.is_file():
@@ -165,6 +207,7 @@ def build_archive(
             shutil.copyfile(source, destination)
         os.chmod(staging_root / "bin" / "gitveil", 0o755)
         os.chmod(staging_root / "libexec" / "gitveil" / "sops", 0o755)
+        os.chmod(staging_root / "libexec" / "gitveil" / "age-keygen", 0o755)
         archive = output_dir / f"{archive_root}.tar.gz"
         write_archive(staging_root, archive)
     validate_archive(archive, archive_root)

@@ -1,6 +1,7 @@
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
 compile_error!("Gitveil v1 supports macOS and Linux only");
 
+pub(crate) mod age;
 pub mod baseline;
 pub mod cli;
 pub mod config;
@@ -9,6 +10,7 @@ pub(crate) mod confine;
 pub mod envelope;
 pub mod error;
 pub(crate) mod git;
+pub(crate) mod identity;
 pub mod manifest;
 pub(crate) mod open;
 pub mod path;

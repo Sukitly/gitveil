@@ -3,18 +3,20 @@ pub mod support;
 use std::fs;
 use std::process::Command;
 
-use support::{GitFixture, assert_success, command_output, sops_binary};
+use support::{GitFixture, age_keygen_binary, assert_success, command_output, sops_binary};
 
 fn binary() -> std::path::PathBuf {
     assert_cmd::cargo::cargo_bin!("gitveil").to_path_buf()
 }
 
 #[test]
-fn help_lists_exactly_the_seven_public_commands() {
+fn help_lists_exactly_the_eight_public_commands() {
     let output = command_output(Command::new(binary()).arg("--help"));
     assert_eq!(output.status.code(), Some(0));
     let help = String::from_utf8(output.stdout).expect("help UTF-8");
-    for command in ["init", "add", "open", "seal", "status", "verify", "resolve"] {
+    for command in [
+        "identity", "init", "add", "open", "seal", "status", "verify", "resolve",
+    ] {
         assert!(help.contains(command), "help must list {command}: {help}");
     }
     for removed in [
@@ -36,6 +38,29 @@ fn help_lists_exactly_the_seven_public_commands() {
             "help must not list {removed}: {help}"
         );
     }
+}
+
+#[test]
+fn identity_help_lists_generation_and_recipient_derivation() {
+    let output = command_output(Command::new(binary()).args(["identity", "--help"]));
+    assert_eq!(output.status.code(), Some(0));
+    let help = String::from_utf8(output.stdout).expect("identity help UTF-8");
+    assert!(
+        help.lines()
+            .any(|line| line.trim_start().starts_with("generate"))
+    );
+    assert!(
+        help.lines()
+            .any(|line| line.trim_start().starts_with("recipients"))
+    );
+
+    let output = command_output(Command::new(binary()).args(["identity", "recipients", "--help"]));
+    assert_eq!(output.status.code(), Some(0));
+    let help = String::from_utf8(output.stdout).expect("recipient help UTF-8");
+    let normalized = help.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(normalized.contains("SOPS_AGE_KEY_FILE"));
+    assert!(normalized.contains("platform default key file"));
+    assert!(!normalized.contains("SOPS_AGE_KEY_CMD"));
 }
 
 #[test]
@@ -71,6 +96,8 @@ fn usage_errors_exit_two() {
     assert_eq!(unknown.status.code(), Some(2));
     let missing = command_output(&mut Command::new(binary()));
     assert_eq!(missing.status.code(), Some(2));
+    let identity_without_operation = command_output(Command::new(binary()).arg("identity"));
+    assert_eq!(identity_without_operation.status.code(), Some(2));
     let init_without_recipient = command_output(Command::new(binary()).arg("init"));
     assert_eq!(init_without_recipient.status.code(), Some(2));
     let add_without_format = command_output(Command::new(binary()).args(["add", ".env"]));
@@ -195,13 +222,34 @@ fn installed_layout_uses_the_private_sidecar_without_system_sops_or_age() {
     let prefix = tempfile::tempdir().expect("install prefix");
     let installed_binary = prefix.path().join("bin/gitveil");
     let installed_sops = prefix.path().join("libexec/gitveil/sops");
+    let installed_age_keygen = prefix.path().join("libexec/gitveil/age-keygen");
     fs::create_dir_all(installed_binary.parent().expect("bin parent")).expect("create bin");
     fs::create_dir_all(installed_sops.parent().expect("sidecar parent")).expect("create libexec");
     fs::copy(binary(), &installed_binary).expect("install gitveil");
     fs::copy(sops_binary(), &installed_sops).expect("install sops");
+    fs::copy(age_keygen_binary(), &installed_age_keygen).expect("install age-keygen");
     fs::set_permissions(&installed_binary, fs::Permissions::from_mode(0o755))
         .expect("gitveil mode");
     fs::set_permissions(&installed_sops, fs::Permissions::from_mode(0o755)).expect("sops mode");
+    fs::set_permissions(&installed_age_keygen, fs::Permissions::from_mode(0o755))
+        .expect("age-keygen mode");
+
+    let mut identity_command = fixture.command_with_identity(&installed_binary);
+    identity_command
+        .env_remove("AGE_KEYGEN_BIN")
+        .env("PATH", "/usr/bin:/bin")
+        .args(["identity", "recipients", "--identity"])
+        .arg(fixture.identity());
+    let identity_output = assert_success(
+        command_output(&mut identity_command),
+        "installed recipient derivation",
+    );
+    assert_eq!(
+        String::from_utf8(identity_output.stdout)
+            .expect("installed recipient UTF-8")
+            .trim(),
+        fixture.recipient()
+    );
 
     let mut command = fixture.command_with_identity(&installed_binary);
     command
