@@ -4,6 +4,8 @@
 
 Before the first tagged release, security fixes target `main`. After releases begin, fixes target `main` and the latest released version. Older releases are not supported unless a security advisory states otherwise.
 
+Published GitHub Releases are immutable and include SHA-256 manifests plus GitHub artifact attestations. Installation scripts and native archives obtained from another source are not official Gitveil distributions.
+
 ## Reporting a vulnerability
 
 Do not open a public issue or discussion containing vulnerability details.

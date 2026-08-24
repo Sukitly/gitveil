@@ -14,27 +14,40 @@ Gitveil does not require a system SOPS or age executable. Release archives inclu
 
 ## Installation
 
-Install from a source checkout for the current user:
+Install the latest immutable release on macOS or Linux:
 
 ```bash
-./scripts/install-from-source.py
+curl --proto '=https' --tlsv1.2 -LsSf \
+  https://github.com/Sukitly/gitveil/releases/latest/download/gitveil-installer.sh |
+  sh
 ```
 
-The default prefix is `${CARGO_HOME:-$HOME/.cargo}`. To select another prefix:
+The release-specific installer is version-pinned and embeds the SHA-256 values of all four native archives. It downloads only the archive matching the current OS and architecture, validates its checksum and exact member layout before extraction, verifies all three executables, and transactionally installs the complete distribution under `$HOME/.local`. It never invokes `sudo`, modifies shell configuration, or creates an identity. Select another absolute prefix with:
 
 ```bash
-./scripts/install-from-source.py --prefix ~/.local
+curl --proto '=https' --tlsv1.2 -LsSf \
+  https://github.com/Sukitly/gitveil/releases/latest/download/gitveil-installer.sh |
+  sh -s -- --prefix "$HOME/.local"
 ```
 
-The installer performs a locked release build, fetches and verifies official SOPS 3.13.3 and age-keygen 1.3.1 artifacts, validates the complete release archive, and transactionally installs the binary, private sidecars, and license files. Do not use `cargo install --path .`: Cargo installs only the binary and omits the private sidecars.
-
-The user-facing installation unit is a native release archive. Maintainers build one on each target platform with:
+For a reproducible installation, replace `latest` with an immutable version:
 
 ```bash
-./scripts/build-release-archive.py
+curl --proto '=https' --tlsv1.2 -LsSf \
+  https://github.com/Sukitly/gitveil/releases/download/v0.1.0/gitveil-installer.sh |
+  sh
 ```
 
-The archive is written to `dist/gitveil-v<version>-<os>-<arch>.tar.gz` with this layout:
+To inspect and verify the installer before execution, download it and verify its GitHub artifact attestation:
+
+```bash
+curl --proto '=https' --tlsv1.2 -LO \
+  https://github.com/Sukitly/gitveil/releases/download/v0.1.0/gitveil-installer.sh
+gh attestation verify gitveil-installer.sh --repo Sukitly/gitveil
+sh gitveil-installer.sh
+```
+
+Each release also provides `SHA256SUMS` and native archives for Linux and macOS on x86_64 and aarch64. Every archive contains one complete installation unit:
 
 ```text
 bin/gitveil
@@ -47,7 +60,18 @@ share/licenses/gitveil/AGE-BSD-3-Clause.txt
 share/licenses/gitveil/AGE-NOTICE.txt
 ```
 
-Install all three top-level directories under the same prefix and place `<prefix>/bin` on `PATH`. Gitveil never downloads executables at runtime.
+Place `<prefix>/bin` on `PATH`. Gitveil never downloads executables at runtime.
+
+### Install from source
+
+From a source checkout, build and transactionally install the same complete distribution with:
+
+```bash
+./scripts/install-from-source.py
+./scripts/install-from-source.py --prefix ~/.local
+```
+
+The source installer defaults to `${CARGO_HOME:-$HOME/.cargo}`. Do not use `cargo install --path .`: Cargo installs only the Gitveil binary and omits its private SOPS and age-keygen sidecars.
 
 Source development and tests may explicitly override the private sidecars with `SOPS_BIN` and `AGE_KEYGEN_BIN`; each override must still have its pinned version. These variables are not part of the user installation contract.
 

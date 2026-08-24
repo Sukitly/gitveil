@@ -20,6 +20,7 @@ Inspect the existing implementation and tests before proposing changes. Do not i
 - The Rust version is pinned in `rust-toolchain.toml`.
 - Compatible SOPS and age-keygen builds and artifact checksums are declared in `scripts/_lib/sops_artifacts.py` and `scripts/_lib/age_keygen_artifacts.py`.
 - Files directly under `scripts/` are executable entry points; import-only Python modules belong under `scripts/_lib/` and must not be executable.
+- GitHub Releases is the only authoritative distribution source. Release installers are immutable version assets with embedded native-archive checksums; never install from a moving branch or publish an incomplete binary-only distribution.
 - `Cargo.toml` intentionally has `publish = false`; do not publish the crate or create releases unless explicitly requested.
 - Keep all tracked text, code comments, tests, commit messages, and pull request content in English.
 - Do not add private keys, plaintext secrets, local absolute paths, generated build output, unpublished planning material, or tool transcripts.
@@ -96,6 +97,7 @@ Do not change test expectations merely to make a gate pass. Fix the implementati
 - Update `README.md` when commands, configuration, installation, security boundaries, or release layout change.
 - Update `docs/getting-started.md` when the first-use path changes.
 - Update `CONTRIBUTING.md` when contributor tooling or quality gates change.
+- Update `docs/releasing.md` when release targets, assets, permissions, attestations, or publication controls change.
 - Keep relative links in public Markdown valid; `scripts/check-doc-links.py` enforces them.
 - Keep dependency changes intentional and locked. Explain why a new runtime dependency belongs at its architectural boundary.
 - Preserve third-party license files and notices in release archives.

@@ -1,0 +1,317 @@
+name: Release
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/release.yml"
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - "LICENSE"
+      - "licenses/**"
+      - "scripts/_lib/age_keygen_artifacts.py"
+      - "scripts/_lib/release_archive.py"
+      - "scripts/_lib/release_installer.py"
+      - "scripts/_lib/sops_artifacts.py"
+      - "scripts/assemble-release-assets.py"
+      - "scripts/build-release-archive.py"
+      - "scripts/fetch-test-age-keygen.py"
+      - "scripts/fetch-test-sops.py"
+      - "tests/package_contract.rs"
+      - "tests/release_installer_contract.rs"
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  CARGO_INCREMENTAL: "0"
+  CARGO_TERM_COLOR: always
+  PYTHONDONTWRITEBYTECODE: "1"
+
+jobs:
+  validate:
+    name: Validate release input
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      version: ${{ steps.release.outputs.version }}
+    steps:
+      - name: Check out the release revision
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Validate the release identity
+        id: release
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          RELEASE_SHA: ${{ github.sha }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          manifest_version="$(cargo metadata --no-deps --format-version 1 --locked \
+            | python3 -c 'import json,sys; data=json.load(sys.stdin); print(next(package["version"] for package in data["packages"] if package["name"] == "gitveil"))')"
+          version="$manifest_version"
+          if [[ "$EVENT_NAME" == "push" ]]; then
+            if [[ ! "$RELEASE_TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+              echo "release tag must be an exact vMAJOR.MINOR.PATCH value" >&2
+              exit 1
+            fi
+            version="${RELEASE_TAG#v}"
+            if [[ "$version" != "$manifest_version" ]]; then
+              echo "release tag $RELEASE_TAG does not match Cargo version $manifest_version" >&2
+              exit 1
+            fi
+            if ! git merge-base --is-ancestor "$RELEASE_SHA" refs/remotes/origin/main; then
+              echo "release tag must point to a commit on origin/main" >&2
+              exit 1
+            fi
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build ${{ matrix.system }}-${{ matrix.machine }}
+    needs: validate
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            system: linux
+            machine: x86_64
+            uname_system: Linux
+            uname_machine: x86_64
+          - runner: ubuntu-24.04-arm
+            system: linux
+            machine: aarch64
+            uname_system: Linux
+            uname_machine: aarch64
+          - runner: macos-15-intel
+            system: darwin
+            machine: x86_64
+            uname_system: Darwin
+            uname_machine: x86_64
+          - runner: macos-15
+            system: darwin
+            machine: aarch64
+            uname_system: Darwin
+            uname_machine: arm64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    steps:
+      - name: Check out the release revision
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+
+      - name: Verify the native runner
+        env:
+          EXPECTED_MACHINE: ${{ matrix.uname_machine }}
+          EXPECTED_SYSTEM: ${{ matrix.uname_system }}
+        run: |
+          [[ "$(uname -s)" == "$EXPECTED_SYSTEM" ]]
+          [[ "$(uname -m)" == "$EXPECTED_MACHINE" ]]
+          rustc --version
+          cargo --version
+
+      - name: Install the pinned test runner
+        uses: taiki-e/install-action@6cd13508893c0e7eab5f273c2575d3859bd7229a # v2
+        with:
+          tool: cargo-nextest@0.9.140
+          checksum: true
+          fallback: none
+
+      - name: Fetch checksum-pinned test sidecars
+        run: |
+          sops_bin="$(./scripts/fetch-test-sops.py)"
+          age_keygen_bin="$(./scripts/fetch-test-age-keygen.py)"
+          age_keygen_archive="$(./scripts/fetch-test-age-keygen.py --print-archive)"
+          {
+            echo "SOPS_BIN=$sops_bin"
+            echo "AGE_KEYGEN_BIN=$age_keygen_bin"
+            echo "AGE_KEYGEN_ARCHIVE=$age_keygen_archive"
+          } >> "$GITHUB_ENV"
+
+      - name: Run native host tests
+        run: cargo nextest run --profile ci-host --all-features --locked --no-tests fail
+
+      - name: Build the native release binary
+        run: cargo build --release --locked
+
+      - name: Build the complete native archive
+        env:
+          EXPECTED_ARCHIVE: gitveil-v${{ needs.validate.outputs.version }}-${{ matrix.system }}-${{ matrix.machine }}.tar.gz
+        run: |
+          mkdir release-assets
+          ./scripts/build-release-archive.py \
+            --skip-build \
+            --binary target/release/gitveil \
+            --sops-bin "$SOPS_BIN" \
+            --age-keygen-bin "$AGE_KEYGEN_BIN" \
+            --age-keygen-archive "$AGE_KEYGEN_ARCHIVE" \
+            --output-dir release-assets
+          test -f "release-assets/$EXPECTED_ARCHIVE"
+          test -f "release-assets/$EXPECTED_ARCHIVE.sha256"
+          echo "ARCHIVE=release-assets/$EXPECTED_ARCHIVE" >> "$GITHUB_ENV"
+          echo "ARCHIVE_ROOT=${EXPECTED_ARCHIVE%.tar.gz}" >> "$GITHUB_ENV"
+
+      - name: Verify the archive checksum and executables
+        run: |
+          if command -v sha256sum >/dev/null 2>&1; then
+            (cd release-assets && sha256sum --check "$(basename "$ARCHIVE").sha256")
+          else
+            (cd release-assets && shasum -a 256 --check "$(basename "$ARCHIVE").sha256")
+          fi
+          mkdir release-smoke
+          tar -xzf "$ARCHIVE" -C release-smoke
+          "release-smoke/$ARCHIVE_ROOT/bin/gitveil" --version
+          "release-smoke/$ARCHIVE_ROOT/libexec/gitveil/sops" --disable-version-check --version
+          "release-smoke/$ARCHIVE_ROOT/libexec/gitveil/age-keygen" --version
+
+      - name: Upload the native archive
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-${{ matrix.system }}-${{ matrix.machine }}
+          path: |
+            ${{ env.ARCHIVE }}
+            ${{ env.ARCHIVE }}.sha256
+          if-no-files-found: error
+          retention-days: 7
+
+  assemble:
+    name: Assemble release assets
+    needs:
+      - validate
+      - build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - name: Check out the release revision
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+
+      - name: Download all native archives
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: release-*
+          path: release-assets
+          merge-multiple: true
+
+      - name: Verify native archive transfer checksums
+        run: |
+          mapfile -t archives < <(find release-assets -maxdepth 1 -type f -name 'gitveil-v*.tar.gz' | sort)
+          mapfile -t checksums < <(find release-assets -maxdepth 1 -type f -name 'gitveil-v*.tar.gz.sha256' | sort)
+          [[ "${#archives[@]}" -eq 4 ]]
+          [[ "${#checksums[@]}" -eq 4 ]]
+          for checksum in "${checksums[@]}"; do
+            (cd release-assets && sha256sum --check "$(basename "$checksum")")
+          done
+          rm -- "${checksums[@]}"
+
+      - name: Build the version-pinned installer and manifest
+        run: |
+          ./scripts/assemble-release-assets.py \
+            --version "${{ needs.validate.outputs.version }}" \
+            --archive-dir release-assets \
+            --output-dir release-assets
+          sh -n release-assets/gitveil-installer.sh
+          (cd release-assets && sha256sum --check SHA256SUMS)
+
+      - name: Upload the assembled release
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: assembled-release
+          path: release-assets/
+          if-no-files-found: error
+          retention-days: 7
+
+  attest:
+    name: Attest release assets
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+    needs:
+      - validate
+      - assemble
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - name: Download the assembled release
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: assembled-release
+          path: release-assets
+
+      - name: Attest every final release asset
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
+        with:
+          subject-path: release-assets/*
+
+  draft:
+    name: Create draft release
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+    needs:
+      - validate
+      - assemble
+      - attest
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment:
+      name: release
+      url: ${{ steps.release.outputs.url }}
+    permissions:
+      contents: write
+    steps:
+      - name: Download the assembled release
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: assembled-release
+          path: release-assets
+
+      - name: Verify the final release assets
+        run: |
+          [[ "$(find release-assets -maxdepth 1 -type f | wc -l | tr -d ' ')" -eq 6 ]]
+          (cd release-assets && sha256sum --check SHA256SUMS)
+
+      - name: Create or update the draft release
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            is_draft="$(gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft)"
+            [[ "$is_draft" == "true" ]] || {
+              echo "refusing to replace assets on a published release" >&2
+              exit 1
+            }
+            gh release upload "$RELEASE_TAG" release-assets/* \
+              --repo "$GITHUB_REPOSITORY" \
+              --clobber
+          else
+            gh release create "$RELEASE_TAG" release-assets/* \
+              --repo "$GITHUB_REPOSITORY" \
+              --verify-tag \
+              --draft \
+              --generate-notes \
+              --title "Gitveil $RELEASE_TAG"
+          fi
+          gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json url --jq '"url=" + .url' \
+            >> "$GITHUB_OUTPUT"
