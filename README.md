@@ -187,13 +187,7 @@ Gitveil reads index stages but never runs `git add`.
 
 ## Development
 
-```bash
-./scripts/check-host.sh
-./scripts/check-linux.sh
-./scripts/check-all.sh
-```
-
-The unified local quality gate covers the macOS host, Docker Linux, real SOPS compatibility, release archive structure, and native release builds. GitHub Actions runs the native host gate on Linux and macOS for every pull request and push to `main`.
+Use targeted `cargo test` commands for local development. Complete validation runs in GitHub Actions for every pull request and push to `main`: `Core` runs platform-independent tests and static quality checks once, while `Linux` and `macOS` run the complementary native host tests, release builds, and package validation. See [`CONTRIBUTING.md`](CONTRIBUTING.md) for the test classification and contributor workflow.
 
 ## License
 

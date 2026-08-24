@@ -80,15 +80,13 @@ Match the test level to the contract:
 - Isolate `HOME`, global and system Git configuration, identity environment variables, and fixture state.
 - Every child process needs a deadline and must be killed and reaped after a timeout.
 
-Use targeted tests during development. The public gates are:
+Use targeted tests during development. Complete validation runs only in GitHub Actions:
 
-```bash
-./scripts/check-host.sh
-./scripts/check-linux.sh
-./scripts/check-all.sh
-```
+- `Core` runs platform-independent library unit tests, pure `contract_*` binaries, formatting, architecture and documentation checks, Clippy, and dependency policy once on Ubuntu.
+- `Linux` and `macOS` each run the complementary native host suite, release build, and package validation on a GitHub-hosted runner.
+- `.config/nextest.toml` is the executable test classification. New `tests/*.rs` binaries default to the host suite unless deliberately named `contract_*`; colocated unit tests must remain pure unless their adapter module is explicitly assigned to the host profile.
 
-`check-host.sh` is the native macOS/Linux gate. `check-linux.sh` runs the Linux suite in Docker. `check-all.sh` runs both and therefore must be invoked from macOS. GitHub Actions runs `check-host.sh` natively on Linux and macOS for pull requests and pushes to `main`.
+Do not recreate aggregate local quality-gate scripts or Docker replicas of GitHub-hosted runners. Local commands are for targeted Red/Green feedback; the pull request checks are the complete merge gates.
 
 Do not change test expectations merely to make a gate pass. Fix the implementation, fixture isolation, or contract.
 
@@ -108,7 +106,7 @@ Use English branch names, commits, pull request titles, and descriptions. Keep e
 - a pull request,
 - linear history through squash merging,
 - resolved review conversations,
-- successful `Linux` and `macOS` checks,
+- successful `Core`, `Linux`, and `macOS` checks,
 - a branch tested against the latest `main`.
 
 Before handing off a change, inspect the final diff, run `git diff --check`, confirm that no generated or secret-bearing files are tracked, and report the exact checks run and any checks that could not be run.

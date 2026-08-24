@@ -14,26 +14,26 @@ concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+defaults:
+  run:
+    shell: bash
+
+env:
+  CARGO_INCREMENTAL: "0"
+  CARGO_TERM_COLOR: always
+  PYTHONDONTWRITEBYTECODE: "1"
+
 jobs:
-  quality:
-    name: ${{ matrix.name }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - name: Linux
-            os: ubuntu-latest
-          - name: macOS
-            os: macos-latest
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 90
-    env:
-      CARGO_INCREMENTAL: "0"
-      CARGO_TERM_COLOR: always
-      PYTHONDONTWRITEBYTECODE: "1"
+  core:
+    name: Core
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - name: Check out the repository
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
 
       - name: Activate the pinned Rust toolchain
         run: |
@@ -49,5 +49,103 @@ jobs:
           checksum: true
           fallback: none
 
-      - name: Run the native host quality gate
-        run: ./scripts/check-host.sh
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Check architecture boundaries
+        run: python3 scripts/check-architecture.py
+
+      - name: Check public documentation
+        run: python3 scripts/check-docs.py
+
+      - name: Run Clippy
+        run: cargo clippy --all-targets --all-features --locked -- -D warnings
+
+      - name: Verify the test partition
+        run: |
+          partition="$(mktemp -d)"
+          trap 'rm -rf "$partition"' EXIT
+          cargo nextest list --profile ci-core --all-features --locked | sort -u > "$partition/core"
+          cargo nextest list --profile ci-host --all-features --locked | sort -u > "$partition/host"
+          cargo nextest list --all-features --locked | sort -u > "$partition/all"
+          comm -12 "$partition/core" "$partition/host" > "$partition/overlap"
+          if [[ -s "$partition/overlap" ]]; then
+            echo "Core and host test profiles overlap" >&2
+            exit 1
+          fi
+          cat "$partition/core" "$partition/host" | sort -u > "$partition/combined"
+          diff -u "$partition/all" "$partition/combined"
+
+      - name: Run core tests
+        run: cargo nextest run --profile ci-core --all-features --locked --no-tests fail
+
+      - name: Check dependency policy
+        run: cargo deny check
+
+      - name: Check patch whitespace
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+          HEAD_SHA: ${{ github.sha }}
+        run: |
+          if [[ -n "$BASE_SHA" && "$BASE_SHA" != "0000000000000000000000000000000000000000" ]]; then
+            git diff --check "$BASE_SHA" "$HEAD_SHA"
+          else
+            git diff-tree --check --root --no-commit-id -r "$HEAD_SHA"
+          fi
+
+  host:
+    name: ${{ matrix.name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux
+            os: ubuntu-latest
+          - name: macOS
+            os: macos-latest
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+
+      - name: Activate the pinned Rust toolchain
+        run: |
+          rustc --version
+          cargo --version
+
+      - name: Install pinned test runner
+        uses: taiki-e/install-action@6cd13508893c0e7eab5f273c2575d3859bd7229a # v2
+        with:
+          tool: cargo-nextest@0.9.140
+          checksum: true
+          fallback: none
+
+      - name: Fetch checksum-pinned test sidecars
+        run: |
+          sops_bin="$(python3 scripts/fetch-test-sops.py)"
+          age_keygen_bin="$(python3 scripts/fetch-test-age.py)"
+          age_keygen_archive="$(python3 scripts/fetch-test-age.py --print-archive)"
+          {
+            echo "SOPS_BIN=$sops_bin"
+            echo "AGE_KEYGEN_BIN=$age_keygen_bin"
+            echo "AGE_KEYGEN_ARCHIVE=$age_keygen_archive"
+          } >> "$GITHUB_ENV"
+
+      - name: Run native host tests
+        run: cargo nextest run --profile ci-host --all-features --locked --no-tests fail
+
+      - name: Build the native release binary
+        run: cargo build --release --locked
+
+      - name: Validate the native release package
+        run: |
+          python3 scripts/package-release.py \
+            --skip-build \
+            --binary target/release/gitveil \
+            --sops-bin "$SOPS_BIN" \
+            --age-keygen-bin "$AGE_KEYGEN_BIN" \
+            --age-keygen-archive "$AGE_KEYGEN_ARCHIVE" \
+            --output-dir target/package-test
