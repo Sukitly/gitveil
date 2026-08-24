@@ -6,6 +6,7 @@ use crate::configure::{AddOutcomeKind, add, initialize};
 use crate::error::{ErrorCategory, GitveilError, Result};
 use crate::identity;
 use crate::open::{OpenOutcome, open};
+use crate::recipients::{self, GrantEcho, RecipientFileOutcome};
 use crate::resolve::{ResolveOutcome, resolve};
 use crate::runtime::{read_editor_token, run_internal_editor};
 use crate::seal::{SealOutcome, seal};
@@ -18,6 +19,8 @@ Examples:
   gitveil identity generate
   gitveil init --recipient age1...
   gitveil add .env --format dotenv
+  gitveil recipient add --recipient age1...
+  gitveil recipient remove --policy team --recipient age1...
   gitveil open
   gitveil seal --profile dev
   gitveil seal packages/service/.env
@@ -70,6 +73,11 @@ enum Command {
         #[arg(required = true, value_name = "PATH")]
         paths: Vec<String>,
     },
+    /// Change which recipients can decrypt files under a recipient policy
+    Recipient {
+        #[command(subcommand)]
+        command: RecipientCommand,
+    },
     /// Decrypt managed files into their plaintext siblings (key-wise merge)
     Open {
         /// Select only managed files in this profile
@@ -114,6 +122,28 @@ enum Command {
         #[arg(long)]
         runtime: PathBuf,
         target: PathBuf,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum RecipientCommand {
+    /// Grant decryption to explicitly named public age recipients
+    Add {
+        /// Named recipient policy (inferred only when exactly one exists)
+        #[arg(long, value_name = "POLICY")]
+        policy: Option<String>,
+        /// Public age X25519 recipient to authorize (repeatable)
+        #[arg(long, required = true, action = clap::ArgAction::Append, value_name = "AGE_RECIPIENT")]
+        recipient: Vec<String>,
+    },
+    /// Revoke recipients and rotate each affected file's data key
+    Remove {
+        /// Named recipient policy (inferred only when exactly one exists)
+        #[arg(long, value_name = "POLICY")]
+        policy: Option<String>,
+        /// Public age X25519 recipient to revoke (repeatable)
+        #[arg(long, required = true, action = clap::ArgAction::Append, value_name = "AGE_RECIPIENT")]
+        recipient: Vec<String>,
     },
 }
 
@@ -228,6 +258,7 @@ pub fn run(cli: Cli) -> Result<RunOutcome> {
             profile.as_deref(),
             recipient_policy.as_deref(),
         ),
+        Command::Recipient { command } => run_recipient(&current, &gitveil_binary, command),
         Command::Open { profile, paths } => {
             run_open(&current, &gitveil_binary, &paths, profile.as_deref())
         }
@@ -281,6 +312,73 @@ fn run_identity(
         }
     }
     Ok(RunOutcome::Success)
+}
+
+fn run_recipient(
+    current: &Path,
+    gitveil_binary: &Path,
+    command: RecipientCommand,
+) -> Result<RunOutcome> {
+    let outcome = match command {
+        RecipientCommand::Add { policy, recipient } => {
+            recipients::add(current, gitveil_binary, policy.as_deref(), &recipient)?
+        }
+        RecipientCommand::Remove { policy, recipient } => {
+            recipients::remove(current, gitveil_binary, policy.as_deref(), &recipient)?
+        }
+    };
+    let styled = stdout_styled();
+    // Authorization always names its subject: the full public recipient.
+    for grant in &outcome.grants {
+        match grant {
+            GrantEcho::Added(recipient) => {
+                println!("policy {}: added {recipient}", outcome.policy);
+            }
+            GrantEcho::AlreadyAuthorized(recipient) => {
+                println!("policy {}: {recipient} already authorized", outcome.policy);
+            }
+            GrantEcho::Removed(recipient) => {
+                println!("policy {}: removed {recipient}", outcome.policy);
+            }
+            GrantEcho::RemovedFromCiphertext(recipient) => {
+                println!(
+                    "policy {}: removed {recipient} (was present only on ciphertext)",
+                    outcome.policy
+                );
+            }
+        }
+    }
+    let mut run = RunOutcome::Success;
+    for report in &outcome.reports {
+        match &report.result {
+            Ok(RecipientFileOutcome::Rewrapped) => {
+                println!(
+                    "{}: {}",
+                    report.path,
+                    paint("rewrapped", Tone::Good, styled)
+                );
+            }
+            Ok(RecipientFileOutcome::DataKeyRotated) => {
+                println!(
+                    "{}: {}",
+                    report.path,
+                    paint("data key rotated", Tone::Good, styled)
+                );
+            }
+            Ok(RecipientFileOutcome::AlreadyAligned) => {
+                println!(
+                    "{}: {}",
+                    report.path,
+                    paint("already aligned", Tone::Quiet, styled)
+                );
+            }
+            Err(error) => {
+                run = RunOutcome::Attention;
+                report_error(&report.path, error);
+            }
+        }
+    }
+    Ok(run)
 }
 
 fn run_initialize(current: &Path, policy: &str, recipients: &[String]) -> Result<RunOutcome> {
@@ -405,13 +503,8 @@ fn run_seal(
     let mut outcome = RunOutcome::Success;
     for report in seal(&workspace, paths, profile)? {
         match report.result {
-            Ok(SealOutcome::Sealed { data_key_rotated }) => {
-                let label = if data_key_rotated {
-                    "sealed; data key rotated"
-                } else {
-                    "sealed"
-                };
-                println!("{}: {}", report.path, paint(label, Tone::Good, styled));
+            Ok(SealOutcome::Sealed) => {
+                println!("{}: {}", report.path, paint("sealed", Tone::Good, styled));
             }
             Ok(SealOutcome::Unchanged) => {
                 println!(
@@ -483,13 +576,24 @@ fn run_resolve(current: &Path, gitveil_binary: &Path, paths: &[String]) -> Resul
     let mut outcome = RunOutcome::Success;
     for report in resolve(&workspace, paths)? {
         match report.result {
-            Ok(ResolveOutcome::Resolved { data_key_rotated }) => {
-                let label = if data_key_rotated {
-                    "resolved; data key rotated; review and git add"
-                } else {
-                    "resolved; review and git add"
-                };
-                println!("{}: {}", report.path, paint(label, Tone::Good, styled));
+            Ok(ResolveOutcome::Resolved { recipient_drift }) => {
+                println!(
+                    "{}: {}",
+                    report.path,
+                    paint("resolved; review and git add", Tone::Good, styled)
+                );
+                if recipient_drift {
+                    outcome = RunOutcome::Attention;
+                    println!(
+                        "{}: {}",
+                        report.path,
+                        paint(
+                            "recipient drift remains; run gitveil recipient add or gitveil recipient remove",
+                            Tone::Attention,
+                            styled
+                        )
+                    );
+                }
             }
             Ok(ResolveOutcome::ConflictWritten(node)) => {
                 outcome = RunOutcome::Attention;

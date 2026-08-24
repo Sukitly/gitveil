@@ -7,8 +7,8 @@ use crate::envelope::{CiphertextEnvelope, DecryptedEnvelope};
 use crate::error::{ErrorCategory, GitveilError, Result, SecretBytes};
 use crate::manifest::ResolvedManifestEntry;
 use crate::path::ManagedPath;
-use crate::recipient::RecipientAction;
-use crate::seal::{decrypt_source, rewrap_updatekeys, verify_recipient_policy};
+use crate::recipient::AgeRecipient;
+use crate::seal::decrypt_source;
 use crate::sops::SopsClient;
 use crate::source::{Layout, LineEnding, Node, NodePath, SourceDocument};
 use crate::workspace::Workspace;
@@ -22,7 +22,9 @@ const MARKER_SIZE: usize = 7;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ResolveOutcome {
     /// The merge was completed; ciphertext and plaintext were rewritten.
-    Resolved { data_key_rotated: bool },
+    /// `recipient_drift` reports that the preserved recipient set still
+    /// differs from the manifest policy; `gitveil recipient` converges it.
+    Resolved { recipient_drift: bool },
     /// Same-key conflicts remain: the plaintext holds a conflict document to
     /// edit, the working ciphertext was normalized to the local (ours) side,
     /// and `gitveil seal` finishes the resolution.
@@ -101,30 +103,15 @@ fn resolve_entry(
                 .and_then(|envelope| envelope.to_yaml())
                 .map(SecretBytes::new)
                 .map_err(|error| GitveilError::ciphertext(path, &error.to_string()))?;
-            // The alignment direction is decided from the ours-side envelope
-            // an edit would preserve. A removal re-encrypts the
-            // merged result directly under a fresh data key the removed party
-            // cannot unwrap; the old key never touches the merged values.
+            // Resolve is a data command: the merged envelope keeps the
+            // ours-side recipient set byte-for-byte in its wrapped keys.
+            // Authorization changes only through `gitveil recipient`.
             let ours_envelope = CiphertextEnvelope::parse(ours, entry.format())
                 .map_err(|error| GitveilError::ciphertext(path, &error.to_string()))?;
-            let recipient_action = entry
-                .recipient_policy()
-                .diff(ours_envelope.age_recipients())
-                .action();
-            let data_key_rotated = matches!(recipient_action, RecipientAction::Rotate);
-            let ciphertext = match recipient_action {
-                RecipientAction::Rotate => {
-                    sops.encrypt_new(&desired, path, entry.recipient_policy())?
-                }
-                RecipientAction::Aligned => sops.edit(ours, &desired, path)?,
-                RecipientAction::Rewrap => {
-                    let edited = sops.edit(ours, &desired, path)?;
-                    rewrap_updatekeys(sops, &edited, entry)?
-                }
-            };
+            let ciphertext = sops.edit(ours, &desired, path)?;
             let envelope = CiphertextEnvelope::parse(&ciphertext, entry.format())
                 .map_err(|error| GitveilError::ciphertext(path, &error.to_string()))?;
-            verify_recipient_policy(&envelope, entry)?;
+            verify_recipients_preserved(&ours_envelope, &envelope, path)?;
             let verified = decrypt_source(sops, &ciphertext, entry)?;
             if !verified.semantic_eq(&merged) {
                 return Err(GitveilError::new(
@@ -145,7 +132,11 @@ fn resolve_entry(
                 );
                 store.save(path, &record)?;
             }
-            Ok(ResolveOutcome::Resolved { data_key_rotated })
+            let recipient_drift = !entry
+                .recipient_policy()
+                .diff(envelope.age_recipients())
+                .is_empty();
+            Ok(ResolveOutcome::Resolved { recipient_drift })
         }
         MergePlan::Conflict {
             path: node,
@@ -159,6 +150,34 @@ fn resolve_entry(
             Ok(ResolveOutcome::ConflictWritten(node))
         }
     }
+}
+
+/// The merge must not change authorization: the output envelope's
+/// recipient set must equal the ours-side set it was edited from.
+fn verify_recipients_preserved(
+    before: &CiphertextEnvelope,
+    after: &CiphertextEnvelope,
+    path: &ManagedPath,
+) -> Result<()> {
+    let mut before = before
+        .age_recipients()
+        .iter()
+        .map(AgeRecipient::as_str)
+        .collect::<Vec<_>>();
+    let mut after = after
+        .age_recipients()
+        .iter()
+        .map(AgeRecipient::as_str)
+        .collect::<Vec<_>>();
+    before.sort_unstable();
+    after.sort_unstable();
+    if before == after {
+        return Ok(());
+    }
+    Err(GitveilError::new(
+        ErrorCategory::Integrity,
+        format!("merge changed the envelope recipient set at {path}"),
+    ))
 }
 
 fn decrypt_stage(

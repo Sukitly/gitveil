@@ -183,10 +183,10 @@ fn add_with_publication_fault<F: PublicationFault>(
     Ok(add_outcomes(&plan, &existing_plaintext))
 }
 
-struct ManifestPreparation {
-    path: ManagedPath,
-    original: Vec<u8>,
-    mode: u32,
+pub(crate) struct ManifestPreparation {
+    pub(crate) path: ManagedPath,
+    pub(crate) original: Vec<u8>,
+    pub(crate) mode: u32,
 }
 
 struct IgnorePreparation {
@@ -204,7 +204,7 @@ struct RegistrationPublication<'a> {
     manifest_candidate: &'a [u8],
 }
 
-fn load_manifest(root: &Path) -> Result<(ManifestPreparation, Manifest)> {
+pub(crate) fn load_manifest(root: &Path) -> Result<(ManifestPreparation, Manifest)> {
     let path = ManagedPath::new(MANIFEST_FILE_NAME)
         .map_err(|error| GitveilError::configuration(error.to_string()))?;
     let bytes = read_optional(root, &path)?.ok_or_else(|| {
@@ -240,7 +240,8 @@ fn registration_plan(
         .transpose()
         .map_err(|error| GitveilError::configuration(error.to_string()))?
         .unwrap_or_default();
-    let recipient_policy = select_recipient_policy(&manifest, recipient_policy)?;
+    let recipient_policy =
+        select_recipient_policy(&manifest, recipient_policy, "--recipient-policy")?;
     let managed_paths = paths
         .iter()
         .map(|path| validate_registration_path(path))
@@ -429,7 +430,7 @@ fn ignore_states(matches: HashMap<ManagedPath, IgnoreMatch>) -> HashMap<ManagedP
         .collect()
 }
 
-fn serialize_manifest(manifest: &Manifest) -> Result<Vec<u8>> {
+pub(crate) fn serialize_manifest(manifest: &Manifest) -> Result<Vec<u8>> {
     manifest.to_json_bytes().map_err(|_| {
         GitveilError::new(
             ErrorCategory::Integrity,
@@ -551,7 +552,11 @@ fn add_outcomes(
         .collect()
 }
 
-fn select_recipient_policy(manifest: &Manifest, requested: Option<&str>) -> Result<PolicyName> {
+pub(crate) fn select_recipient_policy(
+    manifest: &Manifest,
+    requested: Option<&str>,
+    flag: &str,
+) -> Result<PolicyName> {
     if let Some(requested) = requested {
         let requested = PolicyName::new(requested)
             .map_err(|error| GitveilError::configuration(error.to_string()))?;
@@ -577,12 +582,12 @@ fn select_recipient_policy(manifest: &Manifest, requested: Option<&str>) -> Resu
         )))
     } else {
         Err(GitveilError::configuration(format!(
-            "multiple recipient policies are declared ({names}); pass --recipient-policy"
+            "multiple recipient policies are declared ({names}); pass {flag}"
         )))
     }
 }
 
-fn mutation_repository(current: &Path) -> Result<Repository> {
+pub(crate) fn mutation_repository(current: &Path) -> Result<Repository> {
     let repository = match Repository::discover(current) {
         Ok(repository) => repository,
         Err(RepositoryDiscoveryError::NotRepository) => {
@@ -634,7 +639,7 @@ fn mutation_repository(current: &Path) -> Result<Repository> {
     Ok(repository)
 }
 
-fn read_optional(root: &Path, path: &ManagedPath) -> Result<Option<Vec<u8>>> {
+pub(crate) fn read_optional(root: &Path, path: &ManagedPath) -> Result<Option<Vec<u8>>> {
     let Some(mut file) = confine::open_existing(root, path)? else {
         return Ok(None);
     };
@@ -664,7 +669,7 @@ fn file_mode(root: &Path, path: &ManagedPath) -> Result<Option<u32>> {
         })
 }
 
-fn write_atomic(
+pub(crate) fn write_atomic(
     root: &Path,
     path: &ManagedPath,
     bytes: &[u8],

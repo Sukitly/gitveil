@@ -147,16 +147,32 @@ Gitveil does not currently provide a managed-entry removal command. Manually rem
 
 ## Identity management
 
-Gitveil generates native age identities only when `gitveil identity generate` is explicitly invoked. It does not overwrite, synchronize, distribute, back up, or automatically rotate them. Keep identity files at mode `0600`, back them up securely outside the repository, and have each team member generate an independent identity. Exchange only public recipients, never private keys. The repository stores only public `age1...` recipients. `status` and `verify` remain available without an identity. To add a member, add the member's public recipient to the manifest policy and run `gitveil seal` to rewrap access.
+Gitveil generates native age identities only when `gitveil identity generate` is explicitly invoked. It does not overwrite, synchronize, distribute, back up, or automatically rotate them. Keep identity files at mode `0600`, back them up securely outside the repository, and have each team member generate an independent identity. Exchange only public recipients, never private keys. The repository stores only public `age1...` recipients. `status` and `verify` remain available without an identity.
 
-To remove a member, first rotate the actual secret values in plaintext, remove the member's recipient from the manifest policy, and run `gitveil seal`. When Gitveil detects a recipient removal, it encrypts the entire file under a fresh data key and reports `sealed; data key rotated`; neither the new values nor the new key are decryptable by the removed identity. Addition-only changes keep the existing data key and preserve encrypted leaf bytes.
+Authorization changes only through the explicit recipient commands. To add a member or machine, name its public recipient on the command line:
+
+```bash
+gitveil recipient add --policy team --recipient age1...
+```
+
+The command updates the manifest policy and rewraps every affected ciphertext in one step; addition-only changes keep the existing data key and preserve encrypted leaf bytes. To remove a member, first rotate the actual secret values in plaintext and seal them, then revoke the recipient:
+
+```bash
+gitveil recipient remove --policy team --recipient age1...
+```
+
+A removal re-encrypts every affected file under a fresh data key and reports `data key rotated`; neither later values nor the new key are decryptable by the removed identity. Editing `.gitveilrc.json` by hand grants nothing: the resulting drift blocks `seal` until a recipient command names the difference explicitly, and a recipient the command line does not name is rejected with its full value printed for review.
 
 ## Daily usage
 
 ```bash
-# Plaintext to adjacent ciphertext: create, incrementally edit, or align recipients
+# Plaintext to adjacent ciphertext: create or incrementally edit
 gitveil seal
 gitveil seal --profile dev
+
+# Change who can decrypt: the only authorization entry points
+gitveil recipient add --recipient age1...
+gitveil recipient remove --policy team --recipient age1...
 
 # Ciphertext to plaintext: merge by key against the local baseline
 gitveil open
@@ -174,7 +190,7 @@ gitveil verify --range origin/main..HEAD
 gitveil resolve
 ```
 
-`seal` preserves encrypted bytes for unchanged keys and preserves the entire ciphertext byte-for-byte when plaintext semantics, layout, and recipients are unchanged. After a recipient-policy change, `status` reports recipient drift. Addition-only changes use SOPS `updatekeys` to rewrap the same data key without re-encrypting data or layout leaves. Any removal creates a fresh data key and re-encrypts the entire file so removed identities cannot decrypt later versions.
+`seal` preserves encrypted bytes for unchanged keys and preserves the entire ciphertext byte-for-byte when plaintext semantics and layout are unchanged. Data commands never change authorization: when the manifest policy and a ciphertext's recipient set differ, `seal` fails closed and `status` reports the drift, both pointing to `gitveil recipient`. A first seal of a new file additionally requires every existing ciphertext under the same policy to be aligned, so a tampered policy cannot capture new files while old ones show drift. `recipient add` uses SOPS `updatekeys` to rewrap the same data key without re-encrypting data or layout leaves; `recipient remove` creates a fresh data key and re-encrypts the entire file so removed identities cannot decrypt later versions.
 
 `open` does not overwrite an entire existing plaintext file. Ciphertext-only changes synchronize automatically, plaintext-only changes remain local, and concurrent changes to the same key keep the local value and report a conflict. The baseline at `.git/gitveil/state/` contains only salted digests; when it is missing, Gitveil uses a conservative merge mode.
 
@@ -196,14 +212,16 @@ git add <path>.gitveil
 git commit
 ```
 
-Gitveil reads index stages but never runs `git add`.
+Gitveil reads index stages but never runs `git add`. The merged ciphertext keeps the recipient set of the local (ours) side; if that set differs from the manifest policy, `resolve` reports the remaining drift for `gitveil recipient` to converge.
 
 ## Security boundaries
 
 - Secret values, private identities, and decrypted comments never enter argv, Git configuration, errors, reports, baselines, or tracked metadata.
 - Source keys, hierarchy, scalar types, recipients, and approximate ciphertext lengths are public metadata.
 - Gitveil enforces SOPS `encrypted_regex: .*`; every source scalar and layout/comment value is encrypted.
-- Each ciphertext file uses one data key. Removing a recipient causes `seal` and `resolve` to rotate that key, preventing the removed identity from decrypting later versions. Access to historical versions cannot be revoked; forward exclusion also requires rotating the actual secret values.
+- Data commands never change authorization. A recipient gains the ability to decrypt existing ciphertext only when an identity holder names it explicitly in `gitveil recipient add`; manifest edits alone produce drift that blocks `seal` instead of granting access.
+- Each ciphertext file uses one data key. `gitveil recipient remove` rotates that key, preventing the removed identity from decrypting later versions. Access to historical versions cannot be revoked; forward exclusion also requires rotating the actual secret values.
+- Before the first ciphertext exists under a policy, no cryptographic anchor can detect manifest tampering: the first seal encrypts to the policy as committed. Review every change to `.gitveilrc.json`, and seal promptly after `init`. Once a policy has ciphertext, new files refuse to seal while any of it shows drift.
 - Paths undergo workspace-relative validation and descriptor-relative confinement; symlink and submodule escapes are rejected.
 - SOPS and age-keygen subprocesses have deadlines. Unknown sidecar stderr is redacted and converted into fixed, typed diagnostics rather than being forwarded verbatim.
 - Temporary files and IPC endpoints live in owner-only runtime directories.

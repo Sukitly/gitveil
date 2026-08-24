@@ -16,6 +16,7 @@ pub(crate) mod open;
 pub mod path;
 pub mod profile;
 pub mod recipient;
+pub(crate) mod recipients;
 pub(crate) mod resolve;
 pub mod runtime;
 pub(crate) mod seal;

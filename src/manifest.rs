@@ -95,6 +95,10 @@ impl<'a> ResolvedManifestEntry<'a> {
         self.recipient_policy
     }
 
+    pub(crate) fn policy_name(&self) -> &PolicyName {
+        self.entry.recipient_policy()
+    }
+
     pub(crate) fn ciphertext_path(&self) -> ManagedPath {
         self.entry.ciphertext_path()
     }
@@ -310,6 +314,28 @@ impl Manifest {
         Ok(ManifestEntryAddOutcome::Added)
     }
 
+    /// Replaces the recipient list of an existing policy.
+    ///
+    /// This is the manifest side of `gitveil recipient add`/`remove`; policy
+    /// invariants (non-empty, unique recipients) are enforced by the same
+    /// domain constructor the reader uses.
+    pub(crate) fn set_policy_recipients(
+        &mut self,
+        name: &PolicyName,
+        recipients: Vec<AgeRecipient>,
+    ) -> Result<(), ManifestMutationError> {
+        let Some(slot) = self.recipient_policies.get_mut(name) else {
+            return Err(ManifestMutationError::MissingPolicy(name.clone()));
+        };
+        *slot = AgeRecipientPolicy::new(name.clone(), recipients).map_err(|source| {
+            ManifestMutationError::Policy {
+                policy: name.clone(),
+                source,
+            }
+        })?;
+        Ok(())
+    }
+
     pub(crate) fn to_json_bytes(&self) -> Result<Vec<u8>, ManifestWriteError> {
         let recipient_policies = self
             .recipient_policies
@@ -434,6 +460,11 @@ pub(crate) enum ManifestMutationError {
     CaseCollision(ManagedPath),
     #[error("recipient policy {0} is not declared in {MANIFEST_FILE_NAME}")]
     MissingPolicy(PolicyName),
+    #[error("invalid recipient policy {policy}: {source}")]
+    Policy {
+        policy: PolicyName,
+        source: RecipientError,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
@@ -573,6 +604,35 @@ mod tests {
             manifest.add_entry(entry("SECRET.env", "default", "default")),
             Err(ManifestMutationError::CaseCollision(_))
         ));
+    }
+
+    #[test]
+    fn policy_recipient_replacement_enforces_the_reader_invariants() {
+        let mut manifest = manifest();
+        let name = PolicyName::new("default").expect("policy name");
+        let recipient = crate::recipient::AgeRecipient::new(RECIPIENT).expect("recipient");
+        assert!(matches!(
+            manifest.set_policy_recipients(
+                &PolicyName::new("missing").expect("policy name"),
+                vec![recipient.clone()]
+            ),
+            Err(ManifestMutationError::MissingPolicy(_))
+        ));
+        assert!(matches!(
+            manifest.set_policy_recipients(&name, Vec::new()),
+            Err(ManifestMutationError::Policy { .. })
+        ));
+        manifest
+            .set_policy_recipients(&name, vec![recipient.clone()])
+            .expect("replacement");
+        assert_eq!(
+            manifest
+                .recipient_policy(&name)
+                .expect("policy")
+                .recipients(),
+            &[recipient]
+        );
+        manifest.to_json_bytes().expect("writer round-trip");
     }
 
     #[test]

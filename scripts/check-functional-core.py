@@ -24,6 +24,7 @@ PURE_FILES = [
     "src/semantic/mod.rs",
     "src/manifest.rs",
     "src/configure/plan.rs",
+    "src/recipients/plan.rs",
     "src/baseline/record.rs",
     "src/seal/plan.rs",
     "src/open/plan.rs",
