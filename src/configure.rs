@@ -4,17 +4,21 @@ mod plan;
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::io::{Read, Write};
 use std::os::unix::fs::PermissionsExt;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::Duration;
 
 use crate::config::SourceFormat;
 use crate::confine;
 use crate::envelope::CiphertextEnvelope;
 use crate::error::{ErrorCategory, GitveilError, Result};
-use crate::git::{IgnoreMatch, Repository, RepositoryDiscoveryError};
+use crate::git::{IgnoreMatch, Repository};
 use crate::manifest::{CIPHERTEXT_SUFFIX, GITIGNORE_FILE_NAME, MANIFEST_FILE_NAME, Manifest};
+use crate::manifest_document::{
+    DEFAULT_MODE, ManifestPreparation, NoPublicationFault, PublicationFault, file_mode,
+    load_manifest, mutation_repository, read_optional, select_recipient_policy, serialize_manifest,
+    sync_directory, write_atomic, write_atomic_with_fault,
+};
 use crate::path::ManagedPath;
 use crate::profile::ProfileName;
 use crate::recipient::{AgeRecipient, AgeRecipientPolicy, PolicyName};
@@ -27,23 +31,6 @@ use plan::{
 };
 
 const LOCK_TIMEOUT: Duration = Duration::from_secs(30);
-const DEFAULT_MODE: u32 = 0o644;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum PublicationPoint {
-    BeforePersist,
-    BeforeDirectorySync,
-}
-
-trait PublicationFault {
-    fn check(&self, _path: &ManagedPath, _point: PublicationPoint) -> Result<()> {
-        Ok(())
-    }
-}
-
-struct NoPublicationFault;
-
-impl PublicationFault for NoPublicationFault {}
 
 pub(crate) struct InitOutcome {
     policy: PolicyName,
@@ -183,12 +170,6 @@ fn add_with_publication_fault<F: PublicationFault>(
     Ok(add_outcomes(&plan, &existing_plaintext))
 }
 
-pub(crate) struct ManifestPreparation {
-    pub(crate) path: ManagedPath,
-    pub(crate) original: Vec<u8>,
-    pub(crate) mode: u32,
-}
-
 struct IgnorePreparation {
     path: ManagedPath,
     original: Option<Vec<u8>>,
@@ -202,27 +183,6 @@ struct RegistrationPublication<'a> {
     existing_plaintext: &'a HashSet<ManagedPath>,
     ignore: &'a IgnorePreparation,
     manifest_candidate: &'a [u8],
-}
-
-pub(crate) fn load_manifest(root: &Path) -> Result<(ManifestPreparation, Manifest)> {
-    let path = ManagedPath::new(MANIFEST_FILE_NAME)
-        .map_err(|error| GitveilError::configuration(error.to_string()))?;
-    let bytes = read_optional(root, &path)?.ok_or_else(|| {
-        GitveilError::configuration(format!(
-            "{MANIFEST_FILE_NAME} not found at the repository root; run gitveil init first"
-        ))
-    })?;
-    let manifest =
-        Manifest::parse(&bytes).map_err(|error| GitveilError::configuration(error.to_string()))?;
-    let mode = file_mode(root, &path)?.unwrap_or(DEFAULT_MODE);
-    Ok((
-        ManifestPreparation {
-            path,
-            original: bytes,
-            mode,
-        },
-        manifest,
-    ))
 }
 
 fn registration_plan(
@@ -387,9 +347,9 @@ fn finish_registration_publication<F: PublicationFault>(
     }
     write_atomic_with_fault(
         root,
-        &publication.manifest.path,
+        publication.manifest.path(),
         publication.manifest_candidate,
-        publication.manifest.mode,
+        publication.manifest.mode(),
         true,
         fault,
     )
@@ -430,15 +390,6 @@ fn ignore_states(matches: HashMap<ManagedPath, IgnoreMatch>) -> HashMap<ManagedP
         .collect()
 }
 
-pub(crate) fn serialize_manifest(manifest: &Manifest) -> Result<Vec<u8>> {
-    manifest.to_json_bytes().map_err(|_| {
-        GitveilError::new(
-            ErrorCategory::Integrity,
-            "Gitveil manifest writer violated its internal reader contract",
-        )
-    })
-}
-
 fn ensure_configuration_fresh(
     root: &Path,
     manifest: &ManifestPreparation,
@@ -457,7 +408,7 @@ fn ensure_configuration_fresh(
 }
 
 fn manifest_is_fresh(root: &Path, manifest: &ManifestPreparation) -> Result<bool> {
-    Ok(read_optional(root, &manifest.path)?.as_deref() == Some(manifest.original.as_slice()))
+    manifest.is_fresh(root)
 }
 
 fn ensure_ignore_candidate_fresh(root: &Path, ignore: &IgnorePreparation) -> Result<()> {
@@ -552,194 +503,6 @@ fn add_outcomes(
         .collect()
 }
 
-pub(crate) fn select_recipient_policy(
-    manifest: &Manifest,
-    requested: Option<&str>,
-    flag: &str,
-) -> Result<PolicyName> {
-    if let Some(requested) = requested {
-        let requested = PolicyName::new(requested)
-            .map_err(|error| GitveilError::configuration(error.to_string()))?;
-        if manifest.recipient_policy(&requested).is_none() {
-            return Err(GitveilError::configuration(format!(
-                "recipient policy {requested} is not declared in {MANIFEST_FILE_NAME}"
-            )));
-        }
-        return Ok(requested);
-    }
-    if let Some(only) = manifest.only_policy_name() {
-        return Ok(only.clone());
-    }
-    let names = manifest
-        .policy_names()
-        .into_iter()
-        .map(PolicyName::as_str)
-        .collect::<Vec<_>>()
-        .join(", ");
-    if names.is_empty() {
-        Err(GitveilError::configuration(format!(
-            "{MANIFEST_FILE_NAME} has no recipient policy; declare one before adding files"
-        )))
-    } else {
-        Err(GitveilError::configuration(format!(
-            "multiple recipient policies are declared ({names}); pass {flag}"
-        )))
-    }
-}
-
-pub(crate) fn mutation_repository(current: &Path) -> Result<Repository> {
-    let repository = match Repository::discover(current) {
-        Ok(repository) => repository,
-        Err(RepositoryDiscoveryError::NotRepository) => {
-            if fs::symlink_metadata(current.join(".git")).is_ok() {
-                return Err(GitveilError::new(
-                    ErrorCategory::Process,
-                    "Git repository metadata exists but could not be read",
-                ));
-            }
-            return Err(GitveilError::configuration(
-                "no Git repository metadata found in the current directory; run this command from a Git repository root",
-            ));
-        }
-        Err(RepositoryDiscoveryError::Failure(error)) => return Err(error),
-    };
-    let current = current.canonicalize().map_err(|error| {
-        GitveilError::io(
-            "resolve current directory",
-            Some(current.to_path_buf()),
-            &error,
-        )
-    })?;
-    let root = repository.root().canonicalize().map_err(|error| {
-        GitveilError::io(
-            "resolve Git repository root",
-            Some(repository.root().to_path_buf()),
-            &error,
-        )
-    })?;
-    if current != root {
-        return Err(GitveilError::configuration(format!(
-            "configuration commands must be run from the Git repository root: {}",
-            root.display()
-        )));
-    }
-    let marker = root.join(".git");
-    let metadata = fs::symlink_metadata(&marker).map_err(|_| {
-        GitveilError::configuration(
-            "no Git repository metadata found in the current directory; expected .git",
-        )
-    })?;
-    let file_type = metadata.file_type();
-    if file_type.is_symlink() || !(file_type.is_file() || file_type.is_dir()) {
-        return Err(GitveilError::configuration(
-            "Git repository metadata .git must be a regular file or directory",
-        ));
-    }
-    repository.ensure_supported_version()?;
-    Ok(repository)
-}
-
-pub(crate) fn read_optional(root: &Path, path: &ManagedPath) -> Result<Option<Vec<u8>>> {
-    let Some(mut file) = confine::open_existing(root, path)? else {
-        return Ok(None);
-    };
-    let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes).map_err(|error| {
-        GitveilError::io(
-            "read repository configuration",
-            Some(path.join_to(root)),
-            &error,
-        )
-    })?;
-    Ok(Some(bytes))
-}
-
-fn file_mode(root: &Path, path: &ManagedPath) -> Result<Option<u32>> {
-    let Some(file) = confine::open_existing(root, path)? else {
-        return Ok(None);
-    };
-    file.metadata()
-        .map(|metadata| Some(metadata.permissions().mode() & 0o777))
-        .map_err(|error| {
-            GitveilError::io(
-                "read repository file metadata",
-                Some(path.join_to(root)),
-                &error,
-            )
-        })
-}
-
-pub(crate) fn write_atomic(
-    root: &Path,
-    path: &ManagedPath,
-    bytes: &[u8],
-    mode: u32,
-    replace: bool,
-) -> Result<()> {
-    write_atomic_with_fault(root, path, bytes, mode, replace, &NoPublicationFault)
-}
-
-fn write_atomic_with_fault<F: PublicationFault>(
-    root: &Path,
-    path: &ManagedPath,
-    bytes: &[u8],
-    mode: u32,
-    replace: bool,
-    fault: &F,
-) -> Result<()> {
-    confine::validate_managed_path(root, path)?;
-    let target = path.join_to(root);
-    let parent = target
-        .parent()
-        .ok_or_else(|| GitveilError::configuration("repository path has no parent"))?;
-    let mut temporary = tempfile::NamedTempFile::new_in(parent).map_err(|error| {
-        GitveilError::io(
-            "create repository configuration replacement",
-            Some(parent.to_path_buf()),
-            &error,
-        )
-    })?;
-    temporary
-        .as_file()
-        .set_permissions(fs::Permissions::from_mode(mode))
-        .and_then(|()| temporary.write_all(bytes))
-        .and_then(|()| temporary.as_file_mut().sync_all())
-        .map_err(|error| {
-            GitveilError::io(
-                "write repository configuration replacement",
-                Some(target.clone()),
-                &error,
-            )
-        })?;
-    fault.check(path, PublicationPoint::BeforePersist)?;
-    if replace {
-        temporary.persist(&target).map_err(|error| {
-            GitveilError::io(
-                "replace repository configuration",
-                Some(target.clone()),
-                &error.error,
-            )
-        })?;
-    } else {
-        temporary.persist_noclobber(&target).map_err(|error| {
-            if error.error.kind() == std::io::ErrorKind::AlreadyExists {
-                GitveilError::configuration(format!(
-                    "{path} already exists; init never replaces a manifest"
-                ))
-            } else {
-                GitveilError::io(
-                    "create repository configuration",
-                    Some(target.clone()),
-                    &error.error,
-                )
-            }
-        })?;
-    }
-    fault.check(path, PublicationPoint::BeforeDirectorySync)?;
-    sync_directory(parent)?;
-    Ok(())
-}
-
 fn restore_optional(
     root: &Path,
     path: &ManagedPath,
@@ -763,18 +526,6 @@ fn restore_optional(
     }
 }
 
-fn sync_directory(directory: &Path) -> Result<()> {
-    fs::File::open(directory)
-        .and_then(|file| file.sync_all())
-        .map_err(|error| {
-            GitveilError::io(
-                "sync repository directory",
-                Some(PathBuf::from(directory)),
-                &error,
-            )
-        })
-}
-
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
@@ -783,12 +534,14 @@ mod tests {
 
     use super::{
         ErrorCategory, GITIGNORE_FILE_NAME, GitveilError, IgnorePreparation, MANIFEST_FILE_NAME,
-        ManagedPath, Manifest, ManifestPreparation, PublicationFault, PublicationPoint,
-        RegistrationPublication, finish_registration_publication, manifest_paths,
-        registration_plan, render_managed_ignore, serialize_manifest,
+        ManagedPath, Manifest, ManifestPreparation, PublicationFault, RegistrationPublication,
+        finish_registration_publication, manifest_paths, registration_plan, render_managed_ignore,
+        serialize_manifest,
     };
 
     const RECIPIENT: &str = "age1qyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqs3290gq";
+
+    use crate::manifest_document::PublicationPoint;
 
     struct ManifestPublicationFault(PublicationPoint);
 
@@ -838,11 +591,11 @@ mod tests {
                 .expect("ignore candidate");
             fs::write(root.path().join(GITIGNORE_FILE_NAME), &ignore_candidate)
                 .expect("published ignore");
-            let manifest_preparation = ManifestPreparation {
-                path: ManagedPath::new(MANIFEST_FILE_NAME).expect("manifest path"),
-                original: original.clone(),
-                mode: 0o644,
-            };
+            let manifest_preparation = ManifestPreparation::new(
+                ManagedPath::new(MANIFEST_FILE_NAME).expect("manifest path"),
+                original.clone(),
+                0o644,
+            );
             let ignore_preparation = IgnorePreparation {
                 path: ignore_path,
                 original: None,
@@ -891,11 +644,11 @@ mod tests {
                     .expect("retry plan");
             let retry_candidate =
                 serialize_manifest(retry_plan.manifest()).expect("retry candidate");
-            let retry_preparation = ManifestPreparation {
-                path: ManagedPath::new(MANIFEST_FILE_NAME).expect("manifest path"),
-                original: after_failure,
-                mode: 0o644,
-            };
+            let retry_preparation = ManifestPreparation::new(
+                ManagedPath::new(MANIFEST_FILE_NAME).expect("manifest path"),
+                after_failure,
+                0o644,
+            );
             finish_registration_publication(
                 root.path(),
                 &RegistrationPublication {

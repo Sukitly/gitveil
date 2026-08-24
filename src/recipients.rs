@@ -2,11 +2,12 @@
 //! that change which recipients can decrypt managed ciphertext.
 //!
 //! Data commands (`seal`, `resolve`) fail closed on recipient drift; this
-//! module is the single authorization entry point. The operator's command
-//! line names every recipient whose access changes, and the pure plan
-//! rejects any manifest/envelope difference that the command line does not
-//! explain. The manifest is published first: any mid-run failure leaves
-//! drift that `seal` refuses and an idempotent rerun converges.
+//! module is the single authorization entry point. Each command converges
+//! envelopes only in its own direction and only for the recipients named on
+//! the command line; residual drift against the policy is reported with
+//! full recipient values and keeps `seal` fail-closed. The manifest is
+//! published before file convergence, so any mid-run failure leaves drift
+//! that an idempotent rerun converges.
 
 mod plan;
 
@@ -14,41 +15,62 @@ use std::path::Path;
 use std::time::Duration;
 
 use crate::baseline::{BaselineRecord, BaselineStore, CipherSummary};
-use crate::configure::{
-    ManifestPreparation, load_manifest, mutation_repository, read_optional,
-    select_recipient_policy, serialize_manifest, write_atomic,
-};
 use crate::envelope::{CiphertextEnvelope, DecryptedEnvelope};
 use crate::error::{ErrorCategory, GitveilError, Result, SecretBytes};
-use crate::manifest::{MANIFEST_FILE_NAME, Manifest, ManifestEntry, ResolvedManifestEntry};
+use crate::manifest::{Manifest, ManifestEntry, ResolvedManifestEntry};
+use crate::manifest_document::{
+    load_manifest, mutation_repository, publish_if_fresh, read_optional, select_recipient_policy,
+    serialize_manifest,
+};
 use crate::path::ManagedPath;
 use crate::recipient::{AgeRecipient, AgeRecipientPolicy, PolicyName};
 use crate::runtime::{PrivateRuntime, acquire_lock};
 use crate::seal::decrypt_source;
 use crate::sops::{SopsBinary, SopsClient, SopsPaths};
 use crate::source::SourceDocument;
+use crate::workspace::write_ciphertext_file;
 
-pub(crate) use plan::{ConvergenceAction, GrantEcho};
-use plan::{FileRecipientFacts, RecipientMutation, plan_authorization};
+pub(crate) use plan::{ConvergenceAction, PolicyDelta};
+use plan::{FilePlan, FileRecipientFacts, RecipientMutation, plan_authorization};
 
 const LOCK_TIMEOUT: Duration = Duration::from_secs(30);
-const CIPHERTEXT_MODE: u32 = 0o644;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum RecipientFileOutcome {
     Rewrapped,
     DataKeyRotated,
-    AlreadyAligned,
+    /// The named recipients required no change on this envelope.
+    NoChangeNeeded,
+}
+
+/// One file's committed convergence result plus the residual drift that
+/// remains against the policy (full values: the operator acts on them).
+pub(crate) struct FileConvergence {
+    pub outcome: RecipientFileOutcome,
+    pub pending_additions: Vec<AgeRecipient>,
+    pub pending_removals: Vec<AgeRecipient>,
 }
 
 pub(crate) struct RecipientFileReport {
     pub path: ManagedPath,
-    pub result: Result<RecipientFileOutcome>,
+    pub result: Result<FileConvergence>,
+}
+
+/// What happened to the manifest document itself.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ManifestDisposition {
+    /// The policy already carried the requested state.
+    Unchanged,
+    Published,
+    /// Nothing was published: every required convergence failed preflight.
+    Withheld,
 }
 
 pub(crate) struct AuthorizationOutcome {
     pub policy: PolicyName,
-    pub grants: Vec<GrantEcho>,
+    /// Manifest-level effects; the CLI renders them only after publication.
+    pub deltas: Vec<PolicyDelta>,
+    pub manifest: ManifestDisposition,
     pub reports: Vec<RecipientFileReport>,
 }
 
@@ -120,15 +142,6 @@ fn authorize(
     let plan = plan_authorization(policy, &mutation, &files.facts)
         .map_err(|rejection| GitveilError::configuration(rejection.to_string()))?;
 
-    let desired_policy =
-        AgeRecipientPolicy::new(policy_name.clone(), plan.desired_recipients.clone()).map_err(
-            |error| {
-                GitveilError::new(
-                    ErrorCategory::Integrity,
-                    format!("authorization plan produced an invalid policy: {error}"),
-                )
-            },
-        )?;
     let mut candidate = manifest.clone();
     candidate
         .set_policy_recipients(&policy_name, plan.desired_recipients.clone())
@@ -136,25 +149,32 @@ fn authorize(
     let candidate_bytes = serialize_manifest(&candidate)?;
 
     let mut convergences = Vec::new();
-    for (path, action) in &plan.files {
-        if *action == ConvergenceAction::AlreadyAligned {
+    for file_plan in &plan.files {
+        if file_plan.action == ConvergenceAction::AlreadyAligned {
             reports.push(RecipientFileReport {
-                path: path.clone(),
-                result: Ok(RecipientFileOutcome::AlreadyAligned),
+                path: file_plan.path.clone(),
+                result: Ok(FileConvergence {
+                    outcome: RecipientFileOutcome::NoChangeNeeded,
+                    pending_additions: file_plan.pending_additions.clone(),
+                    pending_removals: file_plan.pending_removals.clone(),
+                }),
             });
             continue;
         }
         let file = files
             .affected
             .iter()
-            .find(|file| file.entry.path() == path)
+            .find(|file| file.entry.path() == &file_plan.path)
             .ok_or_else(|| {
                 GitveilError::new(
                     ErrorCategory::Integrity,
-                    format!("authorization plan references unknown file {path}"),
+                    format!(
+                        "authorization plan references unknown file {}",
+                        file_plan.path
+                    ),
                 )
             })?;
-        convergences.push((file, *action));
+        convergences.push((file, file_plan));
     }
 
     let engine = ConvergenceEngine {
@@ -163,16 +183,22 @@ fn authorize(
         gitveil_binary,
         store: &store,
         manifest: &manifest,
-        preparation: &manifest_preparation,
-        candidate: &candidate_bytes,
-        manifest_changed: plan.manifest_changed,
-        desired_policy: &desired_policy,
+        policy_name: &policy_name,
     };
-    engine.run(convergences, &mut reports)?;
+    let manifest_disposition =
+        engine.run(convergences, &mut reports, plan.manifest_changed, || {
+            publish_if_fresh(
+                &root,
+                &manifest_preparation,
+                &candidate_bytes,
+                "gitveil recipient",
+            )
+        })?;
 
     Ok(AuthorizationOutcome {
         policy: policy_name,
-        grants: plan.grants,
+        deltas: plan.deltas,
+        manifest: manifest_disposition,
         reports,
     })
 }
@@ -246,20 +272,29 @@ struct ConvergenceEngine<'a> {
     gitveil_binary: &'a Path,
     store: &'a BaselineStore,
     manifest: &'a Manifest,
-    preparation: &'a ManifestPreparation,
-    candidate: &'a [u8],
-    manifest_changed: bool,
-    desired_policy: &'a AgeRecipientPolicy,
+    policy_name: &'a PolicyName,
 }
 
 impl ConvergenceEngine<'_> {
     fn run(
         &self,
-        convergences: Vec<(&AffectedFile<'_>, ConvergenceAction)>,
+        convergences: Vec<(&AffectedFile<'_>, &FilePlan)>,
         reports: &mut Vec<RecipientFileReport>,
-    ) -> Result<()> {
+        manifest_changed: bool,
+        publish: impl FnOnce() -> Result<()>,
+    ) -> Result<ManifestDisposition> {
+        let disposition = |published: bool| {
+            if published {
+                ManifestDisposition::Published
+            } else {
+                ManifestDisposition::Unchanged
+            }
+        };
         if convergences.is_empty() {
-            return self.publish_manifest_if_changed();
+            if manifest_changed {
+                publish()?;
+            }
+            return Ok(disposition(manifest_changed));
         }
         let sops = SopsClient::new(
             SopsBinary::discover(None, self.gitveil_binary)?,
@@ -272,10 +307,10 @@ impl ConvergenceEngine<'_> {
 
         // Preflight: prove the current envelopes are decryptable before any
         // publication. When nothing can be decrypted (no identity, or every
-        // file failed) the manifest is not published and nothing changes.
+        // file failed) the manifest is withheld and nothing changes.
         let mut ready = Vec::new();
         let mut failures = Vec::new();
-        for (file, action) in convergences {
+        for (file, file_plan) in convergences {
             let resolved = self.manifest.resolve_entry(file.entry).ok_or_else(|| {
                 GitveilError::new(
                     ErrorCategory::Integrity,
@@ -286,7 +321,7 @@ impl ConvergenceEngine<'_> {
                 )
             })?;
             match decrypt_source(&sops, &file.ciphertext, &resolved) {
-                Ok(document) => ready.push((file, action, resolved, document)),
+                Ok(document) => ready.push((file, file_plan, resolved, document)),
                 Err(error) => failures.push(RecipientFileReport {
                     path: file.entry.path().clone(),
                     result: Err(error),
@@ -294,50 +329,29 @@ impl ConvergenceEngine<'_> {
             }
         }
         if ready.is_empty() {
-            let failure = failures
-                .into_iter()
-                .next()
-                .and_then(|report| report.result.err())
-                .unwrap_or_else(|| {
-                    GitveilError::new(
-                        ErrorCategory::Integrity,
-                        "recipient convergence preflight produced no result",
-                    )
-                });
-            return Err(failure);
+            reports.extend(failures);
+            return Ok(ManifestDisposition::Withheld);
         }
 
-        self.publish_manifest_if_changed()?;
+        if manifest_changed {
+            publish()?;
+        }
 
-        for (file, action, resolved, document) in ready {
-            let result = self.converge_file(&sops, &resolved, &file.ciphertext, &document, action);
+        for (file, file_plan, resolved, document) in ready {
+            let result = self
+                .converge_file(&sops, &resolved, &file.ciphertext, &document, file_plan)
+                .map(|outcome| FileConvergence {
+                    outcome,
+                    pending_additions: file_plan.pending_additions.clone(),
+                    pending_removals: file_plan.pending_removals.clone(),
+                });
             reports.push(RecipientFileReport {
                 path: file.entry.path().clone(),
                 result,
             });
         }
         reports.extend(failures);
-        Ok(())
-    }
-
-    fn publish_manifest_if_changed(&self) -> Result<()> {
-        if !self.manifest_changed {
-            return Ok(());
-        }
-        let current = read_optional(self.root, &self.preparation.path)?;
-        if current.as_deref() != Some(self.preparation.original.as_slice()) {
-            return Err(GitveilError::new(
-                ErrorCategory::Concurrency,
-                format!("{MANIFEST_FILE_NAME} changed while gitveil recipient was running; retry"),
-            ));
-        }
-        write_atomic(
-            self.root,
-            &self.preparation.path,
-            self.candidate,
-            self.preparation.mode,
-            true,
-        )
+        Ok(disposition(manifest_changed))
     }
 
     fn converge_file(
@@ -346,15 +360,27 @@ impl ConvergenceEngine<'_> {
         resolved: &ResolvedManifestEntry<'_>,
         ciphertext: &[u8],
         document: &SourceDocument,
-        action: ConvergenceAction,
+        file_plan: &FilePlan,
     ) -> Result<RecipientFileOutcome> {
         let path = resolved.path();
         let cipher_path = resolved.ciphertext_path();
-        let (converged, outcome) = match action {
-            ConvergenceAction::AlreadyAligned => return Ok(RecipientFileOutcome::AlreadyAligned),
+        let target = AgeRecipientPolicy::new(
+            self.policy_name.clone(),
+            file_plan.target_recipients.clone(),
+        )
+        .map_err(|error| {
+            GitveilError::new(
+                ErrorCategory::Integrity,
+                format!("authorization plan produced an invalid target set: {error}"),
+            )
+        })?;
+        let (converged, outcome) = match file_plan.action {
+            ConvergenceAction::AlreadyAligned => {
+                return Ok(RecipientFileOutcome::NoChangeNeeded);
+            }
             ConvergenceAction::Rewrap => {
-                let rewrapped = sops.rewrap(ciphertext, self.desired_policy)?;
-                self.verify_rewrap(ciphertext, &rewrapped, resolved)?;
+                let rewrapped = sops.rewrap(ciphertext, &target)?;
+                verify_rewrap(ciphertext, &rewrapped, resolved, &target)?;
                 (rewrapped, RecipientFileOutcome::Rewrapped)
             }
             ConvergenceAction::Rotate => {
@@ -365,10 +391,10 @@ impl ConvergenceEngine<'_> {
                     .and_then(|envelope| envelope.to_yaml())
                     .map(SecretBytes::new)
                     .map_err(|error| GitveilError::ciphertext(path, &error.to_string()))?;
-                let rotated = sops.encrypt_new(&desired_bytes, path, self.desired_policy)?;
+                let rotated = sops.encrypt_new(&desired_bytes, path, &target)?;
                 let envelope = CiphertextEnvelope::parse(&rotated, resolved.format())
                     .map_err(|error| GitveilError::ciphertext(path, &error.to_string()))?;
-                self.verify_desired_recipients(&envelope, path)?;
+                verify_target_recipients(&envelope, &target, path)?;
                 let roundtrip = decrypt_source(sops, &rotated, resolved)?;
                 if !roundtrip.semantic_eq(document) {
                     return Err(GitveilError::new(
@@ -379,7 +405,7 @@ impl ConvergenceEngine<'_> {
                 (rotated, RecipientFileOutcome::DataKeyRotated)
             }
         };
-        write_atomic(self.root, &cipher_path, &converged, CIPHERTEXT_MODE, true)?;
+        write_ciphertext_file(self.root, &cipher_path, &converged)?;
         let envelope = CiphertextEnvelope::parse(&converged, resolved.format())
             .map_err(|error| GitveilError::ciphertext(path, &error.to_string()))?;
         let record = BaselineRecord::capture(
@@ -390,47 +416,44 @@ impl ConvergenceEngine<'_> {
         self.store.save(path, &record)?;
         Ok(outcome)
     }
+}
 
-    /// Verifies a rewrap changed only the wrapped data key: the recipient
-    /// set is exactly the desired policy and every encrypted leaf stayed
-    /// byte-for-byte stable.
-    fn verify_rewrap(
-        &self,
-        before: &[u8],
-        after: &[u8],
-        resolved: &ResolvedManifestEntry<'_>,
-    ) -> Result<()> {
-        let path = resolved.path();
-        let before = CiphertextEnvelope::parse(before, resolved.format())
-            .map_err(|error| GitveilError::ciphertext(path, &error.to_string()))?;
-        let after = CiphertextEnvelope::parse(after, resolved.format())
-            .map_err(|error| GitveilError::ciphertext(path, &error.to_string()))?;
-        self.verify_desired_recipients(&after, path)?;
-        if before.leaf_ciphertexts() != after.leaf_ciphertexts()
-            || before.layout_ciphertext() != after.layout_ciphertext()
-        {
-            return Err(GitveilError::new(
-                ErrorCategory::Integrity,
-                format!("SOPS recipient update changed encrypted data at {path}"),
-            ));
-        }
-        Ok(())
-    }
-
-    fn verify_desired_recipients(
-        &self,
-        envelope: &CiphertextEnvelope,
-        path: &ManagedPath,
-    ) -> Result<()> {
-        if self.desired_policy.matches(envelope.age_recipients()) {
-            return Ok(());
-        }
-        Err(GitveilError::new(
+/// Verifies a rewrap changed only the wrapped data key: the recipient set
+/// is exactly the per-file target and every encrypted leaf stayed
+/// byte-for-byte stable.
+fn verify_rewrap(
+    before: &[u8],
+    after: &[u8],
+    resolved: &ResolvedManifestEntry<'_>,
+    target: &AgeRecipientPolicy,
+) -> Result<()> {
+    let path = resolved.path();
+    let before = CiphertextEnvelope::parse(before, resolved.format())
+        .map_err(|error| GitveilError::ciphertext(path, &error.to_string()))?;
+    let after = CiphertextEnvelope::parse(after, resolved.format())
+        .map_err(|error| GitveilError::ciphertext(path, &error.to_string()))?;
+    verify_target_recipients(&after, target, path)?;
+    if before.leaf_ciphertexts() != after.leaf_ciphertexts()
+        || before.layout_ciphertext() != after.layout_ciphertext()
+    {
+        return Err(GitveilError::new(
             ErrorCategory::Integrity,
-            format!(
-                "SOPS result recipients do not match the authorized set of policy {} at {path}",
-                self.desired_policy.name()
-            ),
-        ))
+            format!("SOPS recipient update changed encrypted data at {path}"),
+        ));
     }
+    Ok(())
+}
+
+fn verify_target_recipients(
+    envelope: &CiphertextEnvelope,
+    target: &AgeRecipientPolicy,
+    path: &ManagedPath,
+) -> Result<()> {
+    if target.matches(envelope.age_recipients()) {
+        return Ok(());
+    }
+    Err(GitveilError::new(
+        ErrorCategory::Integrity,
+        format!("SOPS result recipients do not match the authorized target set at {path}"),
+    ))
 }

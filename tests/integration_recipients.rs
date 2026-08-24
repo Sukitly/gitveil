@@ -1,5 +1,10 @@
 //! `gitveil recipient add` / `gitveil recipient remove`: the explicit
 //! authorization commands, and the fail-closed drift contract they anchor.
+//!
+//! Semantics under test: each command converges envelopes only in its own
+//! direction and only for the recipients named on the command line; residual
+//! drift against the policy is reported with full values and keeps `seal`
+//! fail-closed until it is explicitly converged.
 
 pub mod support;
 
@@ -9,7 +14,6 @@ use std::process::Command;
 
 use gitveil::config::SourceFormat;
 use gitveil::envelope::CiphertextEnvelope;
-use gitveil::recipient::AgeRecipient;
 
 use support::{
     GitFixture, assert_success, command_output, contains, encrypted_leaf, generate_age_identity,
@@ -38,8 +42,17 @@ fn recipients_of(fixture: &GitFixture, cipher: &str) -> Vec<String> {
     recipients
 }
 
-fn manifest_json(fixture: &GitFixture) -> serde_json::Value {
-    serde_json::from_slice(&read(fixture, ".gitveilrc.json")).expect("manifest JSON")
+fn manifest_recipients(fixture: &GitFixture) -> Vec<String> {
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&read(fixture, ".gitveilrc.json")).expect("manifest JSON");
+    let mut recipients = manifest["recipientPolicies"]["team"]["age"]
+        .as_array()
+        .expect("age array")
+        .iter()
+        .map(|value| value.as_str().expect("recipient string").to_owned())
+        .collect::<Vec<_>>();
+    recipients.sort_unstable();
+    recipients
 }
 
 /// A recipient whose private identity the fixture never holds: the attacker.
@@ -62,6 +75,22 @@ fn no_op_updatekeys_wrapper(directory: &Path) -> PathBuf {
     path
 }
 
+/// A SOPS wrapper that fails every encryption, so a removal's data-key
+/// rotation fails after the manifest already published.
+fn failing_encrypt_wrapper(directory: &Path) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+
+    let path = directory.join("sops");
+    let real_sops = sops_binary().to_string_lossy().replace('\'', "'\\''");
+    let script = format!(
+        "#!/bin/sh\nfor argument in \"$@\"; do\n  if [ \"$argument\" = --encrypt ]; then\n    exit 1\n  fi\ndone\nexec '{real_sops}' \"$@\"\n"
+    );
+    fs::write(&path, script).expect("write SOPS fault wrapper");
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o700))
+        .expect("secure SOPS fault wrapper");
+    path
+}
+
 #[test]
 fn recipient_add_rewraps_every_policy_file_and_echoes_the_grant() {
     let fixture = GitFixture::new();
@@ -73,31 +102,32 @@ fn recipient_add_rewraps_every_policy_file_and_echoes_the_grant() {
 
     let (second, second_identity) = fixture.add_identity_with_path();
     let added = assert_success(
-        fixture.run_gitveil(&["recipient", "add", "--recipient", second.as_str()]),
+        fixture.run_gitveil(&["recipient", "add", second.as_str()]),
         "recipient add",
     );
     let stdout = String::from_utf8_lossy(&added.stdout);
-    // Authorization names its subject: the full public recipient.
+    // Authorization names its subject, and the per-file effect renders
+    // before the policy-level claim.
     assert!(
         stdout.contains(&format!("policy team: added {second}")),
         "stdout: {stdout}"
     );
     assert!(stdout.contains("secret.env: rewrapped"), "stdout: {stdout}");
+    let file_line = stdout.find("secret.env: rewrapped").expect("file line");
+    let policy_line = stdout.find("policy team: added").expect("policy line");
+    assert!(
+        file_line < policy_line,
+        "file effects must render before policy claims: {stdout}"
+    );
 
     // Manifest and envelope both converged in one command.
-    assert_eq!(
-        manifest_json(&fixture)["recipientPolicies"]["team"]["age"]
-            .as_array()
-            .expect("age array")
-            .len(),
-        2
-    );
-    let after = read(&fixture, "secret.env.gitveil");
     let mut expected = vec![fixture.recipient().to_owned(), second.clone()];
     expected.sort_unstable();
+    assert_eq!(manifest_recipients(&fixture), expected);
     assert_eq!(recipients_of(&fixture, "secret.env.gitveil"), expected);
 
     // Additions rewrap the same data key: every leaf stays byte-stable.
+    let after = read(&fixture, "secret.env.gitveil");
     for leaf in ["A", "B", "layout"] {
         assert_eq!(encrypted_leaf(&after, leaf), encrypted_leaf(&before, leaf));
     }
@@ -113,12 +143,12 @@ fn recipient_add_rewraps_every_policy_file_and_echoes_the_grant() {
 
     // An idempotent rerun changes nothing.
     let rerun = assert_success(
-        fixture.run_gitveil(&["recipient", "add", "--recipient", second.as_str()]),
+        fixture.run_gitveil(&["recipient", "add", second.as_str()]),
         "idempotent rerun",
     );
     let stdout = String::from_utf8_lossy(&rerun.stdout);
-    assert!(stdout.contains("already authorized"), "stdout: {stdout}");
-    assert!(stdout.contains("already aligned"), "stdout: {stdout}");
+    assert!(stdout.contains("already in policy"), "stdout: {stdout}");
+    assert!(stdout.contains("no change needed"), "stdout: {stdout}");
     assert_eq!(read(&fixture, "secret.env.gitveil"), after);
 
     // Sealing still works after the convergence: no drift remains.
@@ -140,7 +170,7 @@ fn recipient_remove_rotates_the_data_key_and_excludes_the_removed_identity() {
 
     let (second, second_identity) = fixture.add_identity_with_path();
     assert_success(
-        fixture.run_gitveil(&["recipient", "add", "--recipient", second.as_str()]),
+        fixture.run_gitveil(&["recipient", "add", second.as_str()]),
         "authorize the second identity",
     );
     let before_removal = read(&fixture, "secret.env.gitveil");
@@ -154,7 +184,7 @@ fn recipient_remove_rotates_the_data_key_and_excludes_the_removed_identity() {
 
     let first = fixture.recipient().to_owned();
     let removed = assert_success(
-        fixture.run_gitveil(&["recipient", "remove", "--recipient", first.as_str()]),
+        fixture.run_gitveil(&["recipient", "remove", first.as_str()]),
         "recipient remove",
     );
     let stdout = String::from_utf8_lossy(&removed.stdout);
@@ -213,15 +243,15 @@ fn recipient_remove_rotates_the_data_key_and_excludes_the_removed_identity() {
 }
 
 // The confused-deputy case D8 exists for: a manifest edit alone must never
-// become effective authorization, even when an identity holder runs the
-// authorization command for an unrelated recipient.
+// become effective authorization. An add that does not name the injected
+// recipient proceeds for what it names, never wraps the injected one, and
+// surfaces it with its full value until it is explicitly added or removed.
 #[test]
-fn an_injected_manifest_recipient_is_rejected_and_named() {
+fn an_injected_manifest_recipient_is_never_wrapped_and_is_surfaced() {
     let fixture = GitFixture::new();
     fixture.initialize();
     write(&fixture, "secret.env", &format!("A={CANARY}\n"));
     assert_success(fixture.run_gitveil(&["seal"]), "initial seal");
-    let ciphertext = read(&fixture, "secret.env.gitveil");
 
     // The attacker writes their recipient into the tracked manifest.
     let attacker = foreign_recipient();
@@ -230,32 +260,59 @@ fn an_injected_manifest_recipient_is_rejected_and_named() {
         &[("secret.env", "dotenv")],
         &[first.as_str(), attacker.as_str()],
     );
-    let tampered_manifest = read(&fixture, ".gitveilrc.json");
 
-    // The user grants a legitimate new machine; the injected recipient is
-    // not named, so the whole command is rejected and names the attacker.
+    // The user grants a legitimate new machine. The command converges only
+    // what it names; the injected recipient stays off the envelope and is
+    // reported in full for review.
     let (second, _) = fixture.add_identity_with_path();
-    let refused = fixture.run_gitveil(&["recipient", "add", "--recipient", second.as_str()]);
-    assert_eq!(refused.status.code(), Some(1));
-    let stderr = String::from_utf8_lossy(&refused.stderr);
+    let output = fixture.run_gitveil(&["recipient", "add", second.as_str()]);
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "residual drift is an attention outcome"
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        stderr.contains(attacker.as_str()),
-        "the unexplained recipient must be named in full: {stderr}"
+        stdout.contains(&format!("drift remains (add {attacker})")),
+        "the unexplained recipient must be named in full: {stdout}"
     );
     assert!(
-        stderr.contains("did not add it"),
-        "the error explains the rejection: {stderr}"
+        stdout.contains(&format!("next: gitveil recipient add {attacker}")),
+        "stdout: {stdout}"
     );
-    assert_eq!(read(&fixture, "secret.env.gitveil"), ciphertext);
-    assert_eq!(read(&fixture, ".gitveilrc.json"), tampered_manifest);
+    let mut expected = vec![first.clone(), second.clone()];
+    expected.sort_unstable();
+    assert_eq!(
+        recipients_of(&fixture, "secret.env.gitveil"),
+        expected,
+        "the injected recipient must never be wrapped"
+    );
 
-    // The attacker cannot decrypt, and daily seal stays blocked, so the
-    // injected recipient never becomes effective.
+    // Daily seal stays blocked while the injected recipient is unresolved.
     let refused_seal = fixture.run_gitveil(&["seal"]);
     assert_eq!(refused_seal.status.code(), Some(1));
-    assert_eq!(read(&fixture, "secret.env.gitveil"), ciphertext);
+
+    // Cleaning up the injection is itself in-product: removing it touches
+    // only the manifest because no envelope carries it.
+    let cleaned = assert_success(
+        fixture.run_gitveil(&["recipient", "remove", attacker.as_str()]),
+        "remove the injected recipient",
+    );
+    let stdout = String::from_utf8_lossy(&cleaned.stdout);
+    assert!(
+        stdout.contains(&format!("policy team: removed {attacker}")),
+        "stdout: {stdout}"
+    );
+    assert_eq!(manifest_recipients(&fixture), {
+        let mut expected = vec![first, second];
+        expected.sort_unstable();
+        expected
+    });
+    assert_success(fixture.run_gitveil(&["seal"]), "seal after cleanup");
 }
 
+// The removal direction of an injected manifest edit: an unrelated add never
+// executes the removal; revoking requires naming the recipient explicitly.
 #[test]
 fn an_injected_manifest_removal_requires_an_explicit_remove() {
     let fixture = GitFixture::new();
@@ -264,27 +321,34 @@ fn an_injected_manifest_removal_requires_an_explicit_remove() {
     assert_success(fixture.run_gitveil(&["seal"]), "initial seal");
     let (second, _) = fixture.add_identity_with_path();
     assert_success(
-        fixture.run_gitveil(&["recipient", "add", "--recipient", second.as_str()]),
+        fixture.run_gitveil(&["recipient", "add", second.as_str()]),
         "authorize the second identity",
     );
 
     // The manifest is hand-edited to drop the second recipient (attacker or
-    // accident); an unrelated add must not silently revoke it.
+    // accident); an unrelated add proceeds but never executes the removal.
     let first = fixture.recipient().to_owned();
     fixture.write_manifest_with_recipients(&[("secret.env", "dotenv")], &[first.as_str()]);
     let (third, _) = fixture.add_identity_with_path();
-    let refused = fixture.run_gitveil(&["recipient", "add", "--recipient", third.as_str()]);
-    assert_eq!(refused.status.code(), Some(1));
-    let stderr = String::from_utf8_lossy(&refused.stderr);
-    assert!(stderr.contains(second.as_str()), "stderr: {stderr}");
+    let output = fixture.run_gitveil(&["recipient", "add", third.as_str()]);
+    assert_eq!(output.status.code(), Some(1), "residual drift remains");
+    let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        stderr.contains("gitveil recipient remove"),
-        "stderr: {stderr}"
+        stdout.contains(&format!("drift remains (remove {second})")),
+        "the pending removal must be named in full: {stdout}"
     );
+    assert!(
+        stdout.contains(&format!("next: gitveil recipient remove {second}")),
+        "stdout: {stdout}"
+    );
+    // The second identity keeps its access until the removal is explicit.
+    let mut on_envelope = vec![first.clone(), second.clone(), third.clone()];
+    on_envelope.sort_unstable();
+    assert_eq!(recipients_of(&fixture, "secret.env.gitveil"), on_envelope);
 
     // Naming the removal explicitly converges it and rotates the data key.
     let removed = assert_success(
-        fixture.run_gitveil(&["recipient", "remove", "--recipient", second.as_str()]),
+        fixture.run_gitveil(&["recipient", "remove", second.as_str()]),
         "explicit removal",
     );
     let stdout = String::from_utf8_lossy(&removed.stdout);
@@ -298,17 +362,91 @@ fn an_injected_manifest_removal_requires_an_explicit_remove() {
         stdout.contains("secret.env: data key rotated"),
         "stdout: {stdout}"
     );
+    let mut expected = vec![first, third];
+    expected.sort_unstable();
+    assert_eq!(recipients_of(&fixture, "secret.env.gitveil"), expected);
+    assert_success(fixture.run_gitveil(&["seal"]), "seal after convergence");
+}
+
+// Mixed drift (both directions at once, e.g. after a pulled policy change
+// plus a resolved merge) converges as two sequential one-sided commands.
+#[test]
+fn mixed_drift_converges_by_sequential_remove_then_add() {
+    let fixture = GitFixture::new();
+    fixture.initialize();
+    write(&fixture, "secret.env", &format!("A={CANARY}\n"));
+    assert_success(fixture.run_gitveil(&["seal"]), "initial seal");
+
+    // Y is a real envelope recipient; snapshot its standalone identity.
+    let (y, y_identity) = fixture.add_identity_with_path();
+    assert_success(
+        fixture.run_gitveil(&["recipient", "add", y.as_str()]),
+        "authorize Y",
+    );
+
+    // The manifest arrives with X in and Y out (teammate's policy change).
+    let (x, x_identity) = fixture.add_identity_with_path();
+    let first = fixture.recipient().to_owned();
+    fixture
+        .write_manifest_with_recipients(&[("secret.env", "dotenv")], &[first.as_str(), x.as_str()]);
+
+    // Both data commands refuse; the state is converged by two explicit
+    // one-sided authorization commands, in the user's natural order.
+    assert_eq!(fixture.run_gitveil(&["seal"]).status.code(), Some(1));
+
+    let removed = fixture.run_gitveil(&["recipient", "remove", y.as_str()]);
+    assert_eq!(
+        removed.status.code(),
+        Some(1),
+        "the pending addition still needs attention"
+    );
+    let stdout = String::from_utf8_lossy(&removed.stdout);
+    assert!(
+        stdout.contains("secret.env: data key rotated"),
+        "stdout: {stdout}"
+    );
+    assert!(
+        stdout.contains(&format!("drift remains (add {x})")),
+        "stdout: {stdout}"
+    );
     assert_eq!(
         recipients_of(&fixture, "secret.env.gitveil"),
         vec![first.clone()]
     );
+
+    let added = assert_success(
+        fixture.run_gitveil(&["recipient", "add", x.as_str()]),
+        "grant X explicitly",
+    );
+    assert!(String::from_utf8_lossy(&added.stdout).contains("secret.env: rewrapped"));
+    let mut expected = vec![first, x];
+    expected.sort_unstable();
+    assert_eq!(recipients_of(&fixture, "secret.env.gitveil"), expected);
     assert_success(fixture.run_gitveil(&["seal"]), "seal after convergence");
+
+    // X decrypts; Y does not.
+    let mut granted: Command = fixture.command_without_identity(fixture.binary());
+    granted.env("SOPS_AGE_KEY_FILE", &x_identity).args(["open"]);
+    assert_success(
+        command_output(&mut granted),
+        "open with the granted identity",
+    );
+    let mut revoked: Command = fixture.command_without_identity(fixture.binary());
+    revoked.env("SOPS_AGE_KEY_FILE", &y_identity).args(["open"]);
+    let output = command_output(&mut revoked);
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "the revoked identity must not decrypt"
+    );
+    assert!(!contains(&output.stdout, CANARY.as_bytes()));
+    assert!(!contains(&output.stderr, CANARY.as_bytes()));
 }
 
-// Mid-run failure semantics: the manifest publishes first, a failed file
-// convergence leaves drift that seal refuses, and a rerun converges it.
+// Mid-run add failure: the manifest publishes first, a failed rewrap leaves
+// drift that seal refuses, and a rerun converges it.
 #[test]
-fn a_failed_convergence_leaves_refusable_drift_and_a_rerun_converges() {
+fn a_failed_rewrap_leaves_refusable_drift_and_a_rerun_converges() {
     let fixture = GitFixture::new();
     fixture.initialize();
     write(&fixture, "secret.env", &format!("A={CANARY}\n"));
@@ -321,7 +459,7 @@ fn a_failed_convergence_leaves_refusable_drift_and_a_rerun_converges() {
     let mut faulted = fixture.gitveil();
     faulted
         .env("SOPS_BIN", wrapper)
-        .args(["recipient", "add", "--recipient", second.as_str()]);
+        .args(["recipient", "add", second.as_str()]);
     let output = command_output(&mut faulted);
     assert_eq!(
         output.status.code(),
@@ -330,50 +468,127 @@ fn a_failed_convergence_leaves_refusable_drift_and_a_rerun_converges() {
     );
     assert!(!contains(&output.stdout, CANARY.as_bytes()));
     assert!(!contains(&output.stderr, CANARY.as_bytes()));
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("not fully effective"),
+        "a partial failure must be called out"
+    );
     // The ciphertext is untouched; the manifest was already published, so
     // the observable state is exactly recipient drift.
     assert_eq!(read(&fixture, "secret.env.gitveil"), ciphertext);
+    let mut expected = vec![fixture.recipient().to_owned(), second.clone()];
+    expected.sort_unstable();
+    assert_eq!(manifest_recipients(&fixture), expected);
     assert_eq!(
-        manifest_json(&fixture)["recipientPolicies"]["team"]["age"]
-            .as_array()
-            .expect("age array")
-            .len(),
-        2
-    );
-    let refused_seal = fixture.run_gitveil(&["seal"]);
-    assert_eq!(
-        refused_seal.status.code(),
+        fixture.run_gitveil(&["seal"]).status.code(),
         Some(1),
         "drift left by the failure keeps seal fail-closed"
     );
 
     // The idempotent rerun (without the fault) converges the drift.
     let rerun = assert_success(
-        fixture.run_gitveil(&["recipient", "add", "--recipient", second.as_str()]),
+        fixture.run_gitveil(&["recipient", "add", second.as_str()]),
         "converging rerun",
     );
     assert!(String::from_utf8_lossy(&rerun.stdout).contains("secret.env: rewrapped"));
     assert_success(fixture.run_gitveil(&["seal"]), "seal after recovery");
 }
 
-// Preflight fails closed: without any usable identity nothing is published,
-// including the manifest.
+// Mid-run remove failure: the output must not claim an effective revocation
+// while the removed identity still decrypts the file.
 #[test]
-fn no_identity_means_no_manifest_publication_and_no_file_changes() {
+fn a_failed_rotation_does_not_claim_effective_revocation() {
     let fixture = GitFixture::new();
     fixture.initialize();
-    write(&fixture, "secret.env", "A=one\n");
+    write(&fixture, "secret.env", &format!("A={CANARY}\n"));
     assert_success(fixture.run_gitveil(&["seal"]), "initial seal");
+    let removed_only = tempfile::tempdir().expect("removed identity directory");
+    let removed_identity = removed_only.path().join("removed.txt");
+    fs::copy(fixture.identity(), &removed_identity).expect("snapshot first identity");
+    let (second, _) = fixture.add_identity_with_path();
+    assert_success(
+        fixture.run_gitveil(&["recipient", "add", second.as_str()]),
+        "authorize the second identity",
+    );
     let ciphertext = read(&fixture, "secret.env.gitveil");
+
+    let first = fixture.recipient().to_owned();
+    let wrapper_directory = tempfile::tempdir().expect("SOPS fault wrapper directory");
+    let wrapper = failing_encrypt_wrapper(wrapper_directory.path());
+    let mut faulted = fixture.gitveil();
+    faulted
+        .env("SOPS_BIN", wrapper)
+        .args(["recipient", "remove", first.as_str()]);
+    let output = command_output(&mut faulted);
+    assert_eq!(output.status.code(), Some(1), "the rotation must fail");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stdout.contains("data key rotated"),
+        "no rotation may be claimed: {stdout}"
+    );
+    assert!(
+        stderr.contains("not fully effective"),
+        "the ineffective revocation must be called out: {stderr}"
+    );
+    // The removed identity still decrypts the untouched file: assert the
+    // real state the output must not contradict.
+    assert_eq!(read(&fixture, "secret.env.gitveil"), ciphertext);
+    let mut still_able: Command = fixture.command_without_identity(fixture.binary());
+    still_able
+        .env("SOPS_AGE_KEY_FILE", &removed_identity)
+        .args(["open"]);
+    assert_success(
+        command_output(&mut still_able),
+        "the identity still decrypts until the rotation really happens",
+    );
+
+    // The rerun converges and only then excludes the identity.
+    let rerun = assert_success(
+        fixture.run_gitveil(&["recipient", "remove", first.as_str()]),
+        "converging rerun",
+    );
+    assert!(String::from_utf8_lossy(&rerun.stdout).contains("secret.env: data key rotated"));
+    let mut excluded: Command = fixture.command_without_identity(fixture.binary());
+    excluded
+        .env("SOPS_AGE_KEY_FILE", &removed_identity)
+        .args(["open"]);
+    assert_eq!(command_output(&mut excluded).status.code(), Some(1));
+}
+
+// Preflight fails closed with per-file reporting: without any usable
+// identity nothing is published and every affected file is reported.
+#[test]
+fn no_identity_reports_every_file_and_publishes_nothing() {
+    let fixture = GitFixture::new();
+    fixture.initialize();
+    fixture.write_manifest_with_recipients(
+        &[("secret.env", "dotenv"), ("other.env", "dotenv")],
+        &[fixture.recipient()],
+    );
+    write(&fixture, "secret.env", "A=one\n");
+    write(&fixture, "other.env", "B=two\n");
+    assert_success(fixture.run_gitveil(&["seal"]), "initial seal");
     let manifest = read(&fixture, ".gitveilrc.json");
+    let first_cipher = read(&fixture, "secret.env.gitveil");
+    let second_cipher = read(&fixture, "other.env.gitveil");
 
     let (second, _) = fixture.add_identity_with_path();
     let mut command: Command = fixture.command_without_identity(fixture.binary());
-    command.args(["recipient", "add", "--recipient", second.as_str()]);
+    command.args(["recipient", "add", second.as_str()]);
     let output = command_output(&mut command);
     assert_eq!(output.status.code(), Some(1));
-    assert_eq!(read(&fixture, "secret.env.gitveil"), ciphertext);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("secret.env") && stderr.contains("other.env"),
+        "every affected file must be reported: {stderr}"
+    );
+    assert!(
+        stderr.contains("nothing was published"),
+        "the withheld publication must be explicit: {stderr}"
+    );
     assert_eq!(read(&fixture, ".gitveilrc.json"), manifest);
+    assert_eq!(read(&fixture, "secret.env.gitveil"), first_cipher);
+    assert_eq!(read(&fixture, "other.env.gitveil"), second_cipher);
 }
 
 #[test]
@@ -387,11 +602,11 @@ fn recipient_argument_validation_fails_before_any_effect() {
 
     // Invalid and private-identity values are rejected.
     for invalid in ["not-a-recipient", "AGE-SECRET-KEY-PRIVATE"] {
-        let output = fixture.run_gitveil(&["recipient", "add", "--recipient", invalid]);
+        let output = fixture.run_gitveil(&["recipient", "add", invalid]);
         assert_eq!(output.status.code(), Some(1), "{invalid}");
     }
     // Removing the last recipient would leave the policy unable to encrypt.
-    let output = fixture.run_gitveil(&["recipient", "remove", "--recipient", first.as_str()]);
+    let output = fixture.run_gitveil(&["recipient", "remove", first.as_str()]);
     assert_eq!(output.status.code(), Some(1));
     assert!(
         String::from_utf8_lossy(&output.stderr).contains("at least one recipient"),
@@ -399,13 +614,15 @@ fn recipient_argument_validation_fails_before_any_effect() {
     );
     // Removing an unknown recipient is rejected.
     let unknown = foreign_recipient();
-    let output = fixture.run_gitveil(&["recipient", "remove", "--recipient", unknown.as_str()]);
+    let output = fixture.run_gitveil(&["recipient", "remove", unknown.as_str()]);
     assert_eq!(output.status.code(), Some(1));
     assert_eq!(read(&fixture, ".gitveilrc.json"), manifest);
 
-    // A usage error without any --recipient exits 2 through clap.
-    let output = fixture.run_gitveil(&["recipient", "add"]);
-    assert_eq!(output.status.code(), Some(2));
+    // A usage error without any recipient exits 2 through clap.
+    for subcommand in ["add", "remove"] {
+        let output = fixture.run_gitveil(&["recipient", subcommand]);
+        assert_eq!(output.status.code(), Some(2), "{subcommand}");
+    }
 }
 
 // Multi-file policies converge together; entries without ciphertext only
@@ -431,7 +648,7 @@ fn recipient_add_converges_multiple_files_and_predeclared_entries() {
 
     let (second, _) = fixture.add_identity_with_path();
     let added = assert_success(
-        fixture.run_gitveil(&["recipient", "add", "--recipient", second.as_str()]),
+        fixture.run_gitveil(&["recipient", "add", second.as_str()]),
         "recipient add across the policy",
     );
     let stdout = String::from_utf8_lossy(&added.stdout);
@@ -451,6 +668,4 @@ fn recipient_add_converges_multiple_files_and_predeclared_entries() {
         "first seal after convergence",
     );
     assert_eq!(recipients_of(&fixture, "pending.env.gitveil").len(), 2);
-
-    let _ = AgeRecipient::new(second).expect("recipient remains canonical");
 }

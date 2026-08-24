@@ -12,6 +12,7 @@ pub mod error;
 pub(crate) mod git;
 pub(crate) mod identity;
 pub mod manifest;
+pub(crate) mod manifest_document;
 pub(crate) mod open;
 pub mod path;
 pub mod profile;

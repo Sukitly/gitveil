@@ -95,10 +95,6 @@ impl<'a> ResolvedManifestEntry<'a> {
         self.recipient_policy
     }
 
-    pub(crate) fn policy_name(&self) -> &PolicyName {
-        self.entry.recipient_policy()
-    }
-
     pub(crate) fn ciphertext_path(&self) -> ManagedPath {
         self.entry.ciphertext_path()
     }

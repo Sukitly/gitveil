@@ -1,11 +1,14 @@
 //! Pure authorization planning for `gitveil recipient add` and
 //! `gitveil recipient remove`.
 //!
-//! Contract: a recipient gains or loses the ability to decrypt an existing
-//! ciphertext only when the operator names it explicitly on the command
-//! line. Every effective per-file recipient change must be explained by the
-//! requested mutation; an unexplained difference rejects the whole command
-//! and names the offending recipient (age recipients are public metadata).
+//! Contract: each command changes envelopes only in its own direction and
+//! only for the recipients named on the command line. `add` computes each
+//! file's target as `envelope ∪ named`, `remove` as `envelope ∖ named`; a
+//! command never grants or revokes anything it did not name, so a tampered
+//! manifest entry stays ineffective until someone names it explicitly.
+//! Residual difference against the final policy is reported per file with
+//! full recipient values (age recipients are public metadata) and keeps
+//! `seal` fail-closed until it is converged.
 
 use std::collections::HashSet;
 
@@ -29,7 +32,7 @@ pub(super) struct FileRecipientFacts {
     pub envelope_recipients: Option<Vec<AgeRecipient>>,
 }
 
-/// How one existing ciphertext is brought to the desired recipient set.
+/// How one existing ciphertext converges to its per-file target set.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ConvergenceAction {
     AlreadyAligned,
@@ -41,27 +44,40 @@ pub(crate) enum ConvergenceAction {
     Rotate,
 }
 
-/// Echo of one requested recipient's actual effect, rendered by the CLI so
-/// the authorization action always names its subject.
+/// The manifest-level effect of one requested recipient, rendered by the
+/// CLI after publication so every claim is about a committed state.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum GrantEcho {
-    Added(AgeRecipient),
-    AlreadyAuthorized(AgeRecipient),
-    Removed(AgeRecipient),
+pub(crate) enum PolicyDelta {
+    AddedToPolicy(AgeRecipient),
+    AlreadyInPolicy(AgeRecipient),
+    RemovedFromPolicy(AgeRecipient),
     /// Absent from the policy but present on at least one ciphertext; the
-    /// removal converges that drift.
-    RemovedFromCiphertext(AgeRecipient),
+    /// removal converges that envelope-side drift.
+    RemovedFromCiphertextOnly(AgeRecipient),
+}
+
+/// One file's convergence: the exact target set and the residual drift
+/// against the final policy that remains after this command.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct FilePlan {
+    pub path: ManagedPath,
+    pub action: ConvergenceAction,
+    /// `envelope ± named`: the set this file's envelope converges to.
+    pub target_recipients: Vec<AgeRecipient>,
+    /// Policy recipients not on the target: granting them needs `add`.
+    pub pending_additions: Vec<AgeRecipient>,
+    /// Target recipients not in the policy: revoking them needs `remove`.
+    pub pending_removals: Vec<AgeRecipient>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct AuthorizationPlan {
-    /// Final ordered recipient list for the policy.
+    /// Final ordered recipient list for the manifest policy.
     pub desired_recipients: Vec<AgeRecipient>,
-    /// Whether the manifest policy itself changes.
     pub manifest_changed: bool,
-    /// Convergence action per entry with an existing ciphertext.
-    pub files: Vec<(ManagedPath, ConvergenceAction)>,
-    pub grants: Vec<GrantEcho>,
+    /// Plans for every entry with an existing, parseable ciphertext.
+    pub files: Vec<FilePlan>,
+    pub deltas: Vec<PolicyDelta>,
 }
 
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
@@ -73,67 +89,9 @@ pub(super) enum AuthorizationRejection {
     #[error("a policy must keep at least one recipient; this removal would empty it")]
     EmptyPolicy,
     #[error(
-        "the policy grants {recipient} but {path}.gitveil does not include it and this command did not add it; remove it from .gitveilrc.json or name it explicitly with gitveil recipient add"
+        "removing these recipients would leave {0}.gitveil with no recipient able to decrypt; run gitveil recipient add first"
     )]
-    UnexplainedAddition {
-        path: ManagedPath,
-        recipient: AgeRecipient,
-    },
-    #[error(
-        "{path}.gitveil includes {recipient} but the policy does not, and this command did not remove it; restore it in .gitveilrc.json or name it explicitly with gitveil recipient remove"
-    )]
-    UnexplainedRemoval {
-        path: ManagedPath,
-        recipient: AgeRecipient,
-    },
-}
-
-fn desired_and_grants(
-    current: &[AgeRecipient],
-    mutation: &RecipientMutation,
-    files: &[FileRecipientFacts],
-) -> Result<(Vec<AgeRecipient>, Vec<GrantEcho>), AuthorizationRejection> {
-    match mutation {
-        RecipientMutation::Add(additions) => {
-            let mut desired = current.to_vec();
-            let mut grants = Vec::with_capacity(additions.len());
-            for addition in additions {
-                if current.contains(addition) {
-                    grants.push(GrantEcho::AlreadyAuthorized(addition.clone()));
-                } else {
-                    desired.push(addition.clone());
-                    grants.push(GrantEcho::Added(addition.clone()));
-                }
-            }
-            Ok((desired, grants))
-        }
-        RecipientMutation::Remove(removals) => {
-            let mut grants = Vec::with_capacity(removals.len());
-            for removal in removals {
-                if current.contains(removal) {
-                    grants.push(GrantEcho::Removed(removal.clone()));
-                } else if files.iter().any(|facts| {
-                    facts
-                        .envelope_recipients
-                        .as_deref()
-                        .is_some_and(|envelope| envelope.contains(removal))
-                }) {
-                    grants.push(GrantEcho::RemovedFromCiphertext(removal.clone()));
-                } else {
-                    return Err(AuthorizationRejection::RemoveNotMember(removal.clone()));
-                }
-            }
-            let desired = current
-                .iter()
-                .filter(|recipient| !removals.contains(recipient))
-                .cloned()
-                .collect::<Vec<_>>();
-            if desired.is_empty() {
-                return Err(AuthorizationRejection::EmptyPolicy);
-            }
-            Ok((desired, grants))
-        }
-    }
+    EmptiesEnvelope(ManagedPath),
 }
 
 pub(super) fn plan_authorization(
@@ -153,63 +111,119 @@ pub(super) fn plan_authorization(
     }
 
     let current = policy.recipients();
-    let (desired, grants) = desired_and_grants(current, mutation, files)?;
+    let (desired, deltas) = manifest_effect(current, mutation, files)?;
     let manifest_changed = desired.as_slice() != current;
 
-    let empty: &[AgeRecipient] = &[];
-    let (named_additions, named_removals) = match mutation {
-        RecipientMutation::Add(recipients) => (recipients.as_slice(), empty),
-        RecipientMutation::Remove(recipients) => (empty, recipients.as_slice()),
-    };
-
-    let mut file_actions = Vec::with_capacity(files.len());
+    let mut file_plans = Vec::with_capacity(files.len());
     for facts in files {
         let Some(envelope) = facts.envelope_recipients.as_deref() else {
             continue;
         };
-        let additions_needed = desired
+        let (target, action) = match mutation {
+            RecipientMutation::Add(additions) => {
+                let mut target = envelope.to_vec();
+                target.extend(
+                    additions
+                        .iter()
+                        .filter(|recipient| !envelope.contains(recipient))
+                        .cloned(),
+                );
+                let action = if target.len() == envelope.len() {
+                    ConvergenceAction::AlreadyAligned
+                } else {
+                    ConvergenceAction::Rewrap
+                };
+                (target, action)
+            }
+            RecipientMutation::Remove(removals) => {
+                let target = envelope
+                    .iter()
+                    .filter(|recipient| !removals.contains(recipient))
+                    .cloned()
+                    .collect::<Vec<_>>();
+                if target.is_empty() {
+                    return Err(AuthorizationRejection::EmptiesEnvelope(facts.path.clone()));
+                }
+                let action = if target.len() == envelope.len() {
+                    ConvergenceAction::AlreadyAligned
+                } else {
+                    ConvergenceAction::Rotate
+                };
+                (target, action)
+            }
+        };
+        let pending_additions = desired
             .iter()
-            .filter(|recipient| !envelope.contains(recipient))
-            .collect::<Vec<_>>();
-        let removals_needed = envelope
+            .filter(|recipient| !target.contains(recipient))
+            .cloned()
+            .collect();
+        let pending_removals = target
             .iter()
             .filter(|recipient| !desired.contains(recipient))
-            .collect::<Vec<_>>();
-        if let Some(recipient) = additions_needed
-            .iter()
-            .find(|recipient| !named_additions.contains(recipient))
-        {
-            return Err(AuthorizationRejection::UnexplainedAddition {
-                path: facts.path.clone(),
-                recipient: (*recipient).clone(),
-            });
-        }
-        if let Some(recipient) = removals_needed
-            .iter()
-            .find(|recipient| !named_removals.contains(recipient))
-        {
-            return Err(AuthorizationRejection::UnexplainedRemoval {
-                path: facts.path.clone(),
-                recipient: (*recipient).clone(),
-            });
-        }
-        let action = if removals_needed.is_empty() {
-            if additions_needed.is_empty() {
-                ConvergenceAction::AlreadyAligned
-            } else {
-                ConvergenceAction::Rewrap
-            }
-        } else {
-            ConvergenceAction::Rotate
-        };
-        file_actions.push((facts.path.clone(), action));
+            .cloned()
+            .collect();
+        file_plans.push(FilePlan {
+            path: facts.path.clone(),
+            action,
+            target_recipients: target,
+            pending_additions,
+            pending_removals,
+        });
     }
     Ok(AuthorizationPlan {
         desired_recipients: desired,
         manifest_changed,
-        files: file_actions,
-        grants,
+        files: file_plans,
+        deltas,
     })
+}
+
+fn manifest_effect(
+    current: &[AgeRecipient],
+    mutation: &RecipientMutation,
+    files: &[FileRecipientFacts],
+) -> Result<(Vec<AgeRecipient>, Vec<PolicyDelta>), AuthorizationRejection> {
+    match mutation {
+        RecipientMutation::Add(additions) => {
+            let mut desired = current.to_vec();
+            let mut deltas = Vec::with_capacity(additions.len());
+            for addition in additions {
+                if current.contains(addition) {
+                    deltas.push(PolicyDelta::AlreadyInPolicy(addition.clone()));
+                } else {
+                    desired.push(addition.clone());
+                    deltas.push(PolicyDelta::AddedToPolicy(addition.clone()));
+                }
+            }
+            Ok((desired, deltas))
+        }
+        RecipientMutation::Remove(removals) => {
+            let mut deltas = Vec::with_capacity(removals.len());
+            for removal in removals {
+                if current.contains(removal) {
+                    deltas.push(PolicyDelta::RemovedFromPolicy(removal.clone()));
+                } else if files.iter().any(|facts| {
+                    facts
+                        .envelope_recipients
+                        .as_deref()
+                        .is_some_and(|envelope| envelope.contains(removal))
+                }) {
+                    deltas.push(PolicyDelta::RemovedFromCiphertextOnly(removal.clone()));
+                } else {
+                    return Err(AuthorizationRejection::RemoveNotMember(removal.clone()));
+                }
+            }
+            let desired = current
+                .iter()
+                .filter(|recipient| !removals.contains(recipient))
+                .cloned()
+                .collect::<Vec<_>>();
+            if desired.is_empty() {
+                return Err(AuthorizationRejection::EmptyPolicy);
+            }
+            Ok((desired, deltas))
+        }
+    }
 }
 
 #[cfg(test)]
@@ -220,7 +234,7 @@ mod tests {
     use crate::recipient::{AgeRecipient, AgeRecipientPolicy, PolicyName};
 
     use super::{
-        AuthorizationRejection, ConvergenceAction, FileRecipientFacts, GrantEcho,
+        AuthorizationRejection, ConvergenceAction, FileRecipientFacts, PolicyDelta,
         RecipientMutation, plan_authorization,
     };
 
@@ -247,7 +261,7 @@ mod tests {
     }
 
     #[test]
-    fn adding_to_an_aligned_state_rewraps_every_existing_ciphertext() {
+    fn add_targets_envelope_plus_named_and_rewraps() {
         let (a, b) = (recipient(1), recipient(2));
         let plan = plan_authorization(
             &policy(&[&a]),
@@ -255,74 +269,51 @@ mod tests {
             &[file(".env", Some(&[&a])), file("fresh.env", None)],
         )
         .expect("plan");
-        assert_eq!(plan.desired_recipients, vec![a, b.clone()]);
+        assert_eq!(plan.desired_recipients, vec![a.clone(), b.clone()]);
         assert!(plan.manifest_changed);
         assert_eq!(plan.files.len(), 1);
-        assert_eq!(plan.files[0].1, ConvergenceAction::Rewrap);
-        assert_eq!(plan.grants, vec![GrantEcho::Added(b)]);
+        assert_eq!(plan.files[0].action, ConvergenceAction::Rewrap);
+        assert_eq!(plan.files[0].target_recipients, vec![a, b.clone()]);
+        assert!(plan.files[0].pending_additions.is_empty());
+        assert!(plan.files[0].pending_removals.is_empty());
+        assert_eq!(plan.deltas, vec![PolicyDelta::AddedToPolicy(b)]);
     }
 
+    // The confused-deputy case: an injected manifest recipient is never
+    // wrapped by an add that does not name it; it surfaces as residual drift.
     #[test]
-    fn an_idempotent_add_reports_already_authorized_and_already_aligned() {
-        let (a, b) = (recipient(1), recipient(2));
+    fn add_grants_only_named_recipients_and_reports_injected_ones_as_pending() {
+        let (a, b, injected) = (recipient(1), recipient(2), recipient(9));
         let plan = plan_authorization(
-            &policy(&[&a, &b]),
-            &RecipientMutation::Add(vec![b.clone()]),
-            &[file(".env", Some(&[&a, &b]))],
-        )
-        .expect("plan");
-        assert!(!plan.manifest_changed);
-        assert_eq!(plan.files[0].1, ConvergenceAction::AlreadyAligned);
-        assert_eq!(plan.grants, vec![GrantEcho::AlreadyAuthorized(b)]);
-    }
-
-    #[test]
-    fn add_converges_a_hand_edited_manifest_when_the_difference_is_named() {
-        let (a, b) = (recipient(1), recipient(2));
-        let plan = plan_authorization(
-            &policy(&[&a, &b]),
+            &policy(&[&a, &injected]),
             &RecipientMutation::Add(vec![b.clone()]),
             &[file(".env", Some(&[&a]))],
         )
         .expect("plan");
-        assert!(!plan.manifest_changed);
-        assert_eq!(plan.files[0].1, ConvergenceAction::Rewrap);
+        assert_eq!(plan.files[0].target_recipients, vec![a, b]);
+        assert_eq!(plan.files[0].pending_additions, vec![injected]);
+        assert_eq!(plan.files[0].action, ConvergenceAction::Rewrap);
     }
 
+    // An add never executes a removal, even when the manifest lost a
+    // recipient (attack or accident): the envelope keeps it, reported as
+    // pending removal.
     #[test]
-    fn an_injected_manifest_addition_is_rejected_and_named() {
-        let (a, b, injected) = (recipient(1), recipient(2), recipient(9));
-        assert_eq!(
-            plan_authorization(
-                &policy(&[&a, &injected]),
-                &RecipientMutation::Add(vec![b]),
-                &[file(".env", Some(&[&a]))],
-            ),
-            Err(AuthorizationRejection::UnexplainedAddition {
-                path: ManagedPath::new(".env").expect("managed path"),
-                recipient: injected,
-            })
-        );
-    }
-
-    #[test]
-    fn an_injected_manifest_removal_is_rejected_by_add() {
+    fn add_never_removes_envelope_recipients() {
         let (a, b, c) = (recipient(1), recipient(2), recipient(3));
-        assert_eq!(
-            plan_authorization(
-                &policy(&[&a]),
-                &RecipientMutation::Add(vec![c]),
-                &[file(".env", Some(&[&a, &b]))],
-            ),
-            Err(AuthorizationRejection::UnexplainedRemoval {
-                path: ManagedPath::new(".env").expect("managed path"),
-                recipient: b,
-            })
-        );
+        let plan = plan_authorization(
+            &policy(&[&a]),
+            &RecipientMutation::Add(vec![c.clone()]),
+            &[file(".env", Some(&[&a, &b]))],
+        )
+        .expect("plan");
+        assert_eq!(plan.files[0].target_recipients, vec![a, b.clone(), c]);
+        assert_eq!(plan.files[0].pending_removals, vec![b]);
+        assert_eq!(plan.files[0].action, ConvergenceAction::Rewrap);
     }
 
     #[test]
-    fn removing_a_policy_member_rotates_every_existing_ciphertext() {
+    fn remove_targets_envelope_minus_named_and_rotates() {
         let (a, b) = (recipient(1), recipient(2));
         let plan = plan_authorization(
             &policy(&[&a, &b]),
@@ -330,28 +321,81 @@ mod tests {
             &[file(".env", Some(&[&a, &b]))],
         )
         .expect("plan");
-        assert_eq!(plan.desired_recipients, vec![a]);
+        assert_eq!(plan.desired_recipients, vec![a.clone()]);
         assert!(plan.manifest_changed);
-        assert_eq!(plan.files[0].1, ConvergenceAction::Rotate);
-        assert_eq!(plan.grants, vec![GrantEcho::Removed(b)]);
+        assert_eq!(plan.files[0].action, ConvergenceAction::Rotate);
+        assert_eq!(plan.files[0].target_recipients, vec![a]);
+        assert_eq!(plan.deltas, vec![PolicyDelta::RemovedFromPolicy(b)]);
+    }
+
+    // Mixed drift converges as two sequential one-sided commands: the user's
+    // "remove Y, then add X" intuition, each step naming exactly its change.
+    #[test]
+    fn mixed_drift_converges_by_sequential_remove_then_add() {
+        let (a, x, y) = (recipient(1), recipient(2), recipient(3));
+        // State: policy [A, X] (X pulled in via manifest), envelope [A, Y].
+        let first = plan_authorization(
+            &policy(&[&a, &x]),
+            &RecipientMutation::Remove(vec![y.clone()]),
+            &[file(".env", Some(&[&a, &y]))],
+        )
+        .expect("remove plan");
+        assert_eq!(first.files[0].action, ConvergenceAction::Rotate);
+        assert_eq!(first.files[0].target_recipients, vec![a.clone()]);
+        assert_eq!(first.files[0].pending_additions, vec![x.clone()]);
+        assert!(!first.manifest_changed, "Y was never in the policy");
+        assert_eq!(
+            first.deltas,
+            vec![PolicyDelta::RemovedFromCiphertextOnly(y)]
+        );
+
+        // After the rotation the envelope is [A]; the add converges fully.
+        let second = plan_authorization(
+            &policy(&[&a, &x]),
+            &RecipientMutation::Add(vec![x.clone()]),
+            &[file(".env", Some(&[&a]))],
+        )
+        .expect("add plan");
+        assert_eq!(second.files[0].action, ConvergenceAction::Rewrap);
+        assert_eq!(second.files[0].target_recipients, vec![a, x.clone()]);
+        assert!(second.files[0].pending_additions.is_empty());
+        assert!(second.files[0].pending_removals.is_empty());
+        assert_eq!(second.deltas, vec![PolicyDelta::AlreadyInPolicy(x)]);
     }
 
     #[test]
-    fn removing_a_ciphertext_only_recipient_converges_removal_drift() {
+    fn idempotent_add_is_already_aligned() {
         let (a, b) = (recipient(1), recipient(2));
         let plan = plan_authorization(
-            &policy(&[&a]),
-            &RecipientMutation::Remove(vec![b.clone()]),
+            &policy(&[&a, &b]),
+            &RecipientMutation::Add(vec![b.clone()]),
             &[file(".env", Some(&[&a, &b]))],
         )
         .expect("plan");
         assert!(!plan.manifest_changed);
-        assert_eq!(plan.files[0].1, ConvergenceAction::Rotate);
-        assert_eq!(plan.grants, vec![GrantEcho::RemovedFromCiphertext(b)]);
+        assert_eq!(plan.files[0].action, ConvergenceAction::AlreadyAligned);
+        assert_eq!(plan.deltas, vec![PolicyDelta::AlreadyInPolicy(b)]);
+    }
+
+    // Cleaning an injected manifest addition is itself in-product: removing
+    // it touches only the manifest because no envelope carries it.
+    #[test]
+    fn removing_a_manifest_only_recipient_changes_no_envelope() {
+        let (a, injected) = (recipient(1), recipient(9));
+        let plan = plan_authorization(
+            &policy(&[&a, &injected]),
+            &RecipientMutation::Remove(vec![injected.clone()]),
+            &[file(".env", Some(&[&a]))],
+        )
+        .expect("plan");
+        assert!(plan.manifest_changed);
+        assert_eq!(plan.files[0].action, ConvergenceAction::AlreadyAligned);
+        assert!(plan.files[0].pending_additions.is_empty());
+        assert_eq!(plan.deltas, vec![PolicyDelta::RemovedFromPolicy(injected)]);
     }
 
     #[test]
-    fn remove_rejects_unknown_recipients_and_an_emptied_policy() {
+    fn remove_rejections_cover_membership_emptiness_and_envelope_emptying() {
         let (a, b, unknown) = (recipient(1), recipient(2), recipient(9));
         assert_eq!(
             plan_authorization(
@@ -359,7 +403,7 @@ mod tests {
                 &RecipientMutation::Remove(vec![unknown.clone()]),
                 &[file(".env", Some(&[&a, &b]))],
             ),
-            Err(AuthorizationRejection::RemoveNotMember(unknown.clone()))
+            Err(AuthorizationRejection::RemoveNotMember(unknown))
         );
         assert_eq!(
             plan_authorization(
@@ -369,23 +413,16 @@ mod tests {
             ),
             Err(AuthorizationRejection::EmptyPolicy)
         );
-    }
-
-    #[test]
-    fn remove_rejects_an_unexplained_manifest_addition() {
-        // The attacker added `injected` to the manifest; a removal of `b`
-        // must not silently wrap the data key to `injected`.
-        let (a, b, injected) = (recipient(1), recipient(2), recipient(9));
+        // The policy keeps a member, but this envelope would lose everyone.
         assert_eq!(
             plan_authorization(
-                &policy(&[&a, &b, &injected]),
+                &policy(&[&a, &b]),
                 &RecipientMutation::Remove(vec![b.clone()]),
-                &[file(".env", Some(&[&a, &b]))],
+                &[file("orphan.env", Some(&[&b]))],
             ),
-            Err(AuthorizationRejection::UnexplainedAddition {
-                path: ManagedPath::new(".env").expect("managed path"),
-                recipient: injected,
-            })
+            Err(AuthorizationRejection::EmptiesEnvelope(
+                ManagedPath::new("orphan.env").expect("managed path")
+            ))
         );
     }
 

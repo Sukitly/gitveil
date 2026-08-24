@@ -170,7 +170,9 @@ fn ensure_policy_ciphertexts_aligned(
     entry: &ResolvedManifestEntry<'_>,
 ) -> Result<()> {
     for other in workspace.manifest().entries() {
-        if other.path() == entry.path() || other.recipient_policy() != entry.policy_name() {
+        if other.path() == entry.path()
+            || other.recipient_policy() != entry.recipient_policy().name()
+        {
             continue;
         }
         let cipher = other.ciphertext_path();
@@ -189,7 +191,7 @@ fn ensure_policy_ciphertexts_aligned(
                 "policy {} has drifted ciphertext at {cipher} (add {}, remove {}); \
                  run gitveil recipient add or gitveil recipient remove before \
                  sealing new files under this policy",
-                entry.policy_name(),
+                entry.recipient_policy().name(),
                 drift.added,
                 drift.removed
             )));

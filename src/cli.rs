@@ -6,7 +6,7 @@ use crate::configure::{AddOutcomeKind, add, initialize};
 use crate::error::{ErrorCategory, GitveilError, Result};
 use crate::identity;
 use crate::open::{OpenOutcome, open};
-use crate::recipients::{self, GrantEcho, RecipientFileOutcome};
+use crate::recipients::{self, ManifestDisposition, PolicyDelta, RecipientFileOutcome};
 use crate::resolve::{ResolveOutcome, resolve};
 use crate::runtime::{read_editor_token, run_internal_editor};
 use crate::seal::{SealOutcome, seal};
@@ -19,8 +19,8 @@ Examples:
   gitveil identity generate
   gitveil init --recipient age1...
   gitveil add .env --format dotenv
-  gitveil recipient add --recipient age1...
-  gitveil recipient remove --policy team --recipient age1...
+  gitveil recipient add age1...
+  gitveil recipient remove --policy team age1...
   gitveil open
   gitveil seal --profile dev
   gitveil seal packages/service/.env
@@ -127,23 +127,23 @@ enum Command {
 
 #[derive(Debug, Subcommand)]
 enum RecipientCommand {
-    /// Grant decryption to explicitly named public age recipients
+    /// Grant decryption to the named public age recipients
     Add {
         /// Named recipient policy (inferred only when exactly one exists)
         #[arg(long, value_name = "POLICY")]
         policy: Option<String>,
-        /// Public age X25519 recipient to authorize (repeatable)
-        #[arg(long, required = true, action = clap::ArgAction::Append, value_name = "AGE_RECIPIENT")]
-        recipient: Vec<String>,
+        /// Public age X25519 recipients to authorize
+        #[arg(required = true, value_name = "AGE_RECIPIENT")]
+        recipients: Vec<String>,
     },
-    /// Revoke recipients and rotate each affected file's data key
+    /// Revoke the named recipients and rotate each affected file's data key
     Remove {
         /// Named recipient policy (inferred only when exactly one exists)
         #[arg(long, value_name = "POLICY")]
         policy: Option<String>,
-        /// Public age X25519 recipient to revoke (repeatable)
-        #[arg(long, required = true, action = clap::ArgAction::Append, value_name = "AGE_RECIPIENT")]
-        recipient: Vec<String>,
+        /// Public age X25519 recipients to revoke
+        #[arg(required = true, value_name = "AGE_RECIPIENT")]
+        recipients: Vec<String>,
     },
 }
 
@@ -320,65 +320,144 @@ fn run_recipient(
     command: RecipientCommand,
 ) -> Result<RunOutcome> {
     let outcome = match command {
-        RecipientCommand::Add { policy, recipient } => {
-            recipients::add(current, gitveil_binary, policy.as_deref(), &recipient)?
+        RecipientCommand::Add { policy, recipients } => {
+            recipients::add(current, gitveil_binary, policy.as_deref(), &recipients)?
         }
-        RecipientCommand::Remove { policy, recipient } => {
-            recipients::remove(current, gitveil_binary, policy.as_deref(), &recipient)?
+        RecipientCommand::Remove { policy, recipients } => {
+            recipients::remove(current, gitveil_binary, policy.as_deref(), &recipients)?
         }
     };
-    let styled = stdout_styled();
-    // Authorization always names its subject: the full public recipient.
-    for grant in &outcome.grants {
-        match grant {
-            GrantEcho::Added(recipient) => {
-                println!("policy {}: added {recipient}", outcome.policy);
-            }
-            GrantEcho::AlreadyAuthorized(recipient) => {
-                println!("policy {}: {recipient} already authorized", outcome.policy);
-            }
-            GrantEcho::Removed(recipient) => {
-                println!("policy {}: removed {recipient}", outcome.policy);
-            }
-            GrantEcho::RemovedFromCiphertext(recipient) => {
-                println!(
-                    "policy {}: removed {recipient} (was present only on ciphertext)",
-                    outcome.policy
-                );
+    let rendered = render_recipient_reports(&outcome.reports);
+    let mut run = rendered.run;
+
+    match outcome.manifest {
+        ManifestDisposition::Withheld => {
+            run = RunOutcome::Attention;
+            eprintln!(
+                "{}",
+                paint(
+                    "gitveil: nothing was published; fix the errors above and retry",
+                    Tone::Bad,
+                    stderr_styled()
+                )
+            );
+        }
+        ManifestDisposition::Published | ManifestDisposition::Unchanged => {
+            for delta in &outcome.deltas {
+                match delta {
+                    PolicyDelta::AddedToPolicy(recipient) => {
+                        println!("policy {}: added {recipient}", outcome.policy);
+                    }
+                    PolicyDelta::AlreadyInPolicy(recipient) => {
+                        println!("policy {}: {recipient} already in policy", outcome.policy);
+                    }
+                    PolicyDelta::RemovedFromPolicy(recipient) => {
+                        println!("policy {}: removed {recipient}", outcome.policy);
+                    }
+                    PolicyDelta::RemovedFromCiphertextOnly(recipient) => {
+                        println!(
+                            "policy {}: removed {recipient} (was present only on ciphertext)",
+                            outcome.policy
+                        );
+                    }
+                }
             }
         }
     }
-    let mut run = RunOutcome::Success;
-    for report in &outcome.reports {
+
+    if !rendered.pending_additions.is_empty() {
+        println!(
+            "next: gitveil recipient add {}",
+            rendered.pending_additions.join(" ")
+        );
+    }
+    if !rendered.pending_removals.is_empty() {
+        println!(
+            "next: gitveil recipient remove {}",
+            rendered.pending_removals.join(" ")
+        );
+    }
+    if rendered.failed && outcome.manifest == ManifestDisposition::Published {
+        eprintln!(
+            "{}",
+            paint(
+                "gitveil: authorization is not fully effective; rerun gitveil recipient after fixing the errors above",
+                Tone::Attention,
+                stderr_styled()
+            )
+        );
+    }
+    Ok(run)
+}
+
+struct RenderedRecipientReports {
+    run: RunOutcome,
+    failed: bool,
+    pending_additions: Vec<String>,
+    pending_removals: Vec<String>,
+}
+
+/// Per-file effects render first: every later policy-level line is a claim
+/// about state the reader has already seen committed or failed.
+fn render_recipient_reports(
+    reports: &[crate::recipients::RecipientFileReport],
+) -> RenderedRecipientReports {
+    let styled = stdout_styled();
+    let mut rendered = RenderedRecipientReports {
+        run: RunOutcome::Success,
+        failed: false,
+        pending_additions: Vec::new(),
+        pending_removals: Vec::new(),
+    };
+    for report in reports {
         match &report.result {
-            Ok(RecipientFileOutcome::Rewrapped) => {
-                println!(
-                    "{}: {}",
-                    report.path,
-                    paint("rewrapped", Tone::Good, styled)
-                );
-            }
-            Ok(RecipientFileOutcome::DataKeyRotated) => {
-                println!(
-                    "{}: {}",
-                    report.path,
-                    paint("data key rotated", Tone::Good, styled)
-                );
-            }
-            Ok(RecipientFileOutcome::AlreadyAligned) => {
-                println!(
-                    "{}: {}",
-                    report.path,
-                    paint("already aligned", Tone::Quiet, styled)
-                );
+            Ok(convergence) => {
+                let label = match convergence.outcome {
+                    RecipientFileOutcome::Rewrapped => "rewrapped",
+                    RecipientFileOutcome::DataKeyRotated => "data key rotated",
+                    RecipientFileOutcome::NoChangeNeeded => "no change needed",
+                };
+                let mut drift = Vec::new();
+                for recipient in &convergence.pending_additions {
+                    drift.push(format!("add {recipient}"));
+                    push_unique(&mut rendered.pending_additions, recipient.as_str());
+                }
+                for recipient in &convergence.pending_removals {
+                    drift.push(format!("remove {recipient}"));
+                    push_unique(&mut rendered.pending_removals, recipient.as_str());
+                }
+                let (line, tone) = if drift.is_empty() {
+                    (
+                        label.to_owned(),
+                        if convergence.outcome == RecipientFileOutcome::NoChangeNeeded {
+                            Tone::Quiet
+                        } else {
+                            Tone::Good
+                        },
+                    )
+                } else {
+                    rendered.run = RunOutcome::Attention;
+                    (
+                        format!("{label}; drift remains ({})", drift.join("; ")),
+                        Tone::Attention,
+                    )
+                };
+                println!("{}: {}", report.path, paint(&line, tone, styled));
             }
             Err(error) => {
-                run = RunOutcome::Attention;
+                rendered.run = RunOutcome::Attention;
+                rendered.failed = true;
                 report_error(&report.path, error);
             }
         }
     }
-    Ok(run)
+    rendered
+}
+
+fn push_unique(values: &mut Vec<String>, value: &str) {
+    if !values.iter().any(|existing| existing == value) {
+        values.push(value.to_owned());
+    }
 }
 
 fn run_initialize(current: &Path, policy: &str, recipients: &[String]) -> Result<RunOutcome> {
@@ -576,12 +655,16 @@ fn run_resolve(current: &Path, gitveil_binary: &Path, paths: &[String]) -> Resul
     let mut outcome = RunOutcome::Success;
     for report in resolve(&workspace, paths)? {
         match report.result {
-            Ok(ResolveOutcome::Resolved { recipient_drift }) => {
-                println!(
-                    "{}: {}",
-                    report.path,
-                    paint("resolved; review and git add", Tone::Good, styled)
-                );
+            Ok(ResolveOutcome::Resolved {
+                data_key_rotated,
+                recipient_drift,
+            }) => {
+                let label = if data_key_rotated {
+                    "resolved; data key rotated; review and git add"
+                } else {
+                    "resolved; review and git add"
+                };
+                println!("{}: {}", report.path, paint(label, Tone::Good, styled));
                 if recipient_drift {
                     outcome = RunOutcome::Attention;
                     println!(

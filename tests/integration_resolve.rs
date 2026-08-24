@@ -6,7 +6,7 @@ use gitveil::config::SourceFormat;
 use gitveil::envelope::CiphertextEnvelope;
 use gitveil::recipient::AgeRecipient;
 
-use support::{GitFixture, assert_success, contains, encrypted_leaf};
+use support::{GitFixture, assert_success, command_output, contains, encrypted_leaf};
 
 fn write(fixture: &GitFixture, path: &str, body: &str) {
     fs::write(fixture.root().join(path), body).expect("write fixture file");
@@ -142,7 +142,7 @@ fn resolve_preserves_ours_recipients_and_reports_policy_drift() {
 
     // The authorization command converges the reported drift.
     assert_success(
-        fixture.run_gitveil(&["recipient", "add", "--recipient", second.as_str()]),
+        fixture.run_gitveil(&["recipient", "add", second.as_str()]),
         "converge drift after resolve",
     );
     let converged = read(&fixture, "secret.env.gitveil");
@@ -154,6 +154,129 @@ fn resolve_preserves_ours_recipients_and_reports_policy_drift() {
         encrypted_leaf(&ours_cipher, "A"),
         "an addition-only convergence keeps the merged leaves"
     );
+}
+
+/// Builds a ciphertext merge conflict whose stage envelopes carry two
+/// recipients, so a policy removal can be exercised against the merge.
+/// Returns the fixture, the second recipient, the second-only identity
+/// file, and a first-only identity file snapshot for exclusion assertions.
+fn conflicted_two_recipient_fixture() -> (GitFixture, String, std::path::PathBuf, std::path::PathBuf)
+{
+    let fixture = GitFixture::new();
+    fixture.initialize();
+    seal_and_commit(&fixture, "A=base\nB=base\n", "base");
+    // Snapshot the first identity alone before the fixture key file gains
+    // the second identity.
+    let first_only = fixture.root().join("..").join("first-only-identity.txt");
+    fs::copy(fixture.identity(), &first_only).expect("snapshot first identity");
+    let (second, second_identity) = fixture.add_identity_with_path();
+    assert_success(
+        fixture.run_gitveil(&["recipient", "add", second.as_str()]),
+        "authorize the second identity",
+    );
+    assert_success(
+        fixture.run_git(&["add", ".gitveilrc.json", "secret.env.gitveil"]),
+        "git add converged configuration",
+    );
+    assert_success(
+        fixture.run_git(&["commit", "-qm", "add second recipient"]),
+        "commit second recipient",
+    );
+    assert_success(
+        fixture.run_git(&["checkout", "-q", "-b", "feature"]),
+        "create feature branch",
+    );
+    seal_and_commit(&fixture, "A=base\nB=theirs\n", "feature change");
+    assert_success(
+        fixture.run_git(&["checkout", "-q", "main"]),
+        "checkout main",
+    );
+    seal_and_commit(&fixture, "A=ours\nB=base\n", "main change");
+    let merge = fixture.run_git(&["merge", "--no-edit", "feature"]);
+    assert!(
+        !merge.status.success(),
+        "resealed envelopes must conflict textually"
+    );
+    (fixture, second, second_identity, first_only)
+}
+
+// A policy that removed a recipient before the merge: resolve encrypts the
+// merged content to the intersection of the ours envelope and the policy,
+// so the removed identity never gains the merged (theirs-side) values.
+#[test]
+fn resolve_narrows_to_the_policy_intersection_and_excludes_removed_recipients() {
+    let (fixture, second, second_identity, removed_identity) = conflicted_two_recipient_fixture();
+
+    // The manifest drops the first recipient (pulled policy change).
+    fixture.write_manifest_with_recipients(&[("secret.env", "dotenv")], &[second.as_str()]);
+
+    let resolved = assert_success(fixture.run_gitveil(&["resolve"]), "gitveil resolve");
+    let stdout = String::from_utf8_lossy(&resolved.stdout);
+    assert!(
+        stdout.contains("data key rotated"),
+        "the narrowing must be reported: {stdout}"
+    );
+    assert!(
+        !stdout.contains("recipient drift remains"),
+        "a pure removal narrows to the full policy: {stdout}"
+    );
+    assert_eq!(read(&fixture, "secret.env"), b"A=ours\nB=theirs\n");
+
+    let merged_cipher = read(&fixture, "secret.env.gitveil");
+    let envelope =
+        CiphertextEnvelope::parse(&merged_cipher, SourceFormat::Dotenv).expect("merged envelope");
+    assert_eq!(
+        envelope.age_recipients(),
+        &[AgeRecipient::new(&second).expect("recipient")],
+        "the removed recipient must not be on the merged envelope"
+    );
+
+    // The kept identity decrypts the merged result through the product
+    // binary; the removed identity cannot: the merged theirs-side value was
+    // never encrypted under a key the removed party holds.
+    let mut kept = fixture.command_without_identity(fixture.binary());
+    kept.env("SOPS_AGE_KEY_FILE", &second_identity).arg("open");
+    assert_success(command_output(&mut kept), "open with the kept identity");
+    let mut excluded = fixture.command_without_identity(fixture.binary());
+    excluded
+        .env("SOPS_AGE_KEY_FILE", &removed_identity)
+        .arg("open");
+    assert_eq!(
+        command_output(&mut excluded).status.code(),
+        Some(1),
+        "the removed identity must not decrypt the merged result"
+    );
+}
+
+// A policy with no recipient in common with the ours envelope cannot accept
+// merged content anywhere safely: resolve refuses with zero side effects.
+#[test]
+fn resolve_refuses_a_disjoint_policy_with_zero_side_effects() {
+    let fixture = conflicted_fixture("A=ours\nB=base\n", "A=base\nB=theirs\n");
+    let replacement = fixture.add_identity();
+    fixture.write_manifest_with_recipients(&[("secret.env", "dotenv")], &[replacement.as_str()]);
+    let ciphertext_before = read(&fixture, "secret.env.gitveil");
+    let plaintext_before = read(&fixture, "secret.env");
+    let index_before = assert_success(
+        fixture.run_git(&["ls-files", "-u", "--", "secret.env.gitveil"]),
+        "read conflicted index",
+    )
+    .stdout;
+
+    let output = fixture.run_gitveil(&["resolve"]);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("gitveil recipient"),
+        "the refusal must route to the authorization command"
+    );
+    assert_eq!(read(&fixture, "secret.env.gitveil"), ciphertext_before);
+    assert_eq!(read(&fixture, "secret.env"), plaintext_before);
+    let index_after = assert_success(
+        fixture.run_git(&["ls-files", "-u", "--", "secret.env.gitveil"]),
+        "read conflicted index after refusal",
+    )
+    .stdout;
+    assert_eq!(index_after, index_before);
 }
 
 #[test]

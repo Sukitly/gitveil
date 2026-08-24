@@ -337,7 +337,7 @@ fn content_edits_do_not_bypass_the_recipient_drift_refusal() {
     assert_eq!(read(&fixture, "secret.env"), b"A=changed\nB=stable\n");
 
     assert_success(
-        fixture.run_gitveil(&["recipient", "add", "--recipient", second.as_str()]),
+        fixture.run_gitveil(&["recipient", "add", second.as_str()]),
         "authorize the addition explicitly",
     );
     assert_success(fixture.run_gitveil(&["seal"]), "seal after convergence");
@@ -383,7 +383,7 @@ fn first_seal_requires_aligned_policy_siblings() {
     );
 
     assert_success(
-        fixture.run_gitveil(&["recipient", "add", "--recipient", second.as_str()]),
+        fixture.run_gitveil(&["recipient", "add", second.as_str()]),
         "converge the policy",
     );
     assert_success(
@@ -396,6 +396,9 @@ fn first_seal_requires_aligned_policy_siblings() {
     assert_eq!(envelope.age_recipients().len(), 2);
 }
 
+// An aligned seal still requires an identity to decrypt its incremental
+// baseline; without one it fails and leaves plaintext, ciphertext, and
+// baseline state untouched.
 #[test]
 fn seal_without_any_envelope_identity_leaves_all_three_files_unchanged() {
     let fixture = GitFixture::new();
@@ -405,23 +408,20 @@ fn seal_without_any_envelope_identity_leaves_all_three_files_unchanged() {
     let ciphertext = read(&fixture, "secret.env.gitveil");
     let state = state_snapshot(&fixture);
 
-    let second = fixture.add_identity();
-    let first = fixture.recipient().to_owned();
-    // Recipient drift now fails closed before any decryption, and a seal
-    // without drift still needs an identity to decrypt its baseline; both
-    // directions leave every file untouched without an identity.
-    for recipients in [
-        vec![first.as_str(), second.as_str()], // addition: drift refusal
-        vec![second.as_str()],                 // removal: drift refusal
-    ] {
-        fixture.write_manifest_with_recipients(&[("secret.env", "dotenv")], &recipients);
-        let mut command: Command = fixture.command_without_identity(fixture.binary());
-        command.arg("seal");
-        let output = support::command_output(&mut command);
-        assert_eq!(output.status.code(), Some(1));
-        assert_eq!(read(&fixture, "secret.env.gitveil"), ciphertext);
-        assert_eq!(state_snapshot(&fixture), state);
-    }
+    // The manifest stays aligned with the envelope: only the identity is
+    // missing, and only the plaintext has a pending edit.
+    write(&fixture, "secret.env", "A=edited\n");
+    let mut command: Command = fixture.command_without_identity(fixture.binary());
+    command.arg("seal");
+    let output = support::command_output(&mut command);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        !String::from_utf8_lossy(&output.stderr).contains("recipient set differs"),
+        "an aligned seal must fail on the identity, not on drift"
+    );
+    assert_eq!(read(&fixture, "secret.env.gitveil"), ciphertext);
+    assert_eq!(read(&fixture, "secret.env"), b"A=edited\n");
+    assert_eq!(state_snapshot(&fixture), state);
 }
 
 #[test]

@@ -91,7 +91,9 @@ fn recipient_help_names_the_explicit_authorization_surface() {
         assert_eq!(output.status.code(), Some(0));
         let help = String::from_utf8_lossy(&output.stdout);
         assert!(help.contains("--policy"), "{subcommand} help: {help}");
-        assert!(help.contains("--recipient"), "{subcommand} help: {help}");
+        // Recipients are the positional direct object, not a flag.
+        assert!(help.contains("AGE_RECIPIENT"), "{subcommand} help: {help}");
+        assert!(!help.contains("--recipient"), "{subcommand} help: {help}");
     }
 
     // The recipient is the required, explicit authorization statement.
