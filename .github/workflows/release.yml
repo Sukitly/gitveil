@@ -288,7 +288,6 @@ jobs:
           (cd release-assets && sha256sum --check SHA256SUMS)
 
       - name: Create or update the draft release
-        id: release
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ github.ref_name }}
@@ -310,8 +309,6 @@ jobs:
               --generate-notes \
               --title "Gitveil $RELEASE_TAG"
           fi
-          gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json url --jq '"url=" + .url' \
-            >> "$GITHUB_OUTPUT"
 
   publish:
     name: Publish release
@@ -327,6 +324,10 @@ jobs:
     permissions:
       contents: write
     steps:
+      # Draft assets stay mutable until publication, so the facts the
+      # approval relies on are re-derived here, inside the gate: the six
+      # assets are downloaded and verified byte-for-byte against SHA256SUMS
+      # and their build attestations before anything goes live.
       - name: Verify the draft release before publication
         env:
           GH_TOKEN: ${{ github.token }}
@@ -338,8 +339,9 @@ jobs:
             echo "release $RELEASE_TAG is not a draft; refusing to touch a published release" >&2
             exit 1
           fi
-          mapfile -t assets < <(gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
-            --json assets --jq '.assets[].name' | sort)
+          mkdir release-review
+          gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --dir release-review
+          mapfile -t assets < <(cd release-review && find . -maxdepth 1 -type f -exec basename {} \; | sort)
           expected=$(printf '%s\n' \
             "SHA256SUMS" \
             "gitveil-installer.sh" \
@@ -352,6 +354,10 @@ jobs:
             printf 'actual:\n%s\n' "${assets[@]}" >&2
             exit 1
           fi
+          (cd release-review && sha256sum --check SHA256SUMS)
+          for asset in release-review/*; do
+            gh attestation verify "$asset" --repo "$GITHUB_REPOSITORY"
+          done
 
       - name: Publish the release
         id: publish

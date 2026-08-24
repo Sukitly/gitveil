@@ -15,7 +15,7 @@ GitHub Actions installs the pinned `cargo-nextest` and `cargo-deny` versions use
 
 ## Making changes
 
-Create a branch from the latest `main`. Keep commits focused and use English for commit messages, pull request titles, descriptions, code comments, tests, and documentation.
+Create a branch from the latest `main`. Keep commits focused and use English for commit messages, pull request titles, descriptions, code comments, tests, and documentation. Branch names starting with `release/` are reserved for `scripts/prepare-release.py`: merging such a branch triggers the automated release tagging described in [`docs/releasing.md`](docs/releasing.md), so never use that prefix for ordinary work.
 
 When changing core behavior, add or update the relevant test first and confirm that it fails for the expected reason before implementing the change. Pure decisions belong in pure modules; filesystem, process, Git, SOPS, environment, clock, and random effects stay at explicit boundaries.
 

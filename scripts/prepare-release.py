@@ -3,23 +3,37 @@
 
 Usage: scripts/prepare-release.py {patch|minor|major}
 
-The script verifies the local checkout is a clean, up-to-date main, computes
-the next version, updates Cargo.toml, Cargo.lock, and the pinned installer
-links in README.md, and opens a pull request from a release/v<version>
-branch. After that pull request merges, create-release-tag.yml tags the
-merge commit, and the tag-triggered release workflow builds, attests, and
-publishes the release once the release environment is approved.
+The script verifies the local checkout is a clean, up-to-date main and that
+every input it needs is present, then updates Cargo.toml, Cargo.lock, and
+the pinned installer links in README.md and opens a pull request from a
+release/v<version> branch. All content and tool checks run before the first
+write; a failure during the write phase rolls the three files back. After
+the pull request merges, create-release-tag.yml tags the merge commit, and
+the tag-triggered release workflow builds, attests, and publishes the
+release once the release environment is approved.
 """
 
+from __future__ import annotations
+
 import argparse
-import re
 import subprocess
 import sys
 from pathlib import Path
 
+from _lib.release_version import (
+    ReleaseVersionError,
+    bumped_version,
+    package_version,
+    rewrite_pinned_downloads,
+    set_package_version,
+)
+
 ROOT = Path(__file__).resolve().parent.parent
-VERSION_PATTERN = re.compile(r'^version = "(\d+)\.(\d+)\.(\d+)"$', re.MULTILINE)
-PINNED_DOWNLOAD_PATTERN = re.compile(r"releases/download/v\d+\.\d+\.\d+/")
+RELEASE_FILES = ("Cargo.toml", "Cargo.lock", "README.md")
+
+
+class CommandError(Exception):
+    """An external command failed; the message names it and its stderr."""
 
 
 def fail(message: str) -> "sys.NoReturn":
@@ -38,8 +52,13 @@ def run(*command: str, capture: bool = False) -> str:
     if result.returncode != 0:
         detail = (result.stderr or "").strip() if capture else ""
         suffix = f": {detail}" if detail else ""
-        fail(f"`{' '.join(command)}` failed{suffix}")
+        raise CommandError(f"`{' '.join(command)}` failed{suffix}")
     return (result.stdout or "").strip() if capture else ""
+
+
+def restore(*command: str) -> None:
+    """Best-effort rollback step; a rollback must never mask the failure."""
+    subprocess.run(command, cwd=ROOT, check=False, capture_output=True)
 
 
 def ref_exists(ref: str) -> bool:
@@ -51,29 +70,10 @@ def ref_exists(ref: str) -> bool:
     )
     if local.returncode == 0:
         return True
-    remote = run("git", "ls-remote", "origin", ref, capture=True)
-    return bool(remote)
+    return bool(run("git", "ls-remote", "origin", ref, capture=True))
 
 
-def current_version() -> tuple[int, int, int]:
-    manifest = (ROOT / "Cargo.toml").read_text(encoding="utf-8")
-    match = VERSION_PATTERN.search(manifest)
-    if match is None:
-        fail("Cargo.toml carries no exact SemVer package version")
-    return int(match.group(1)), int(match.group(2)), int(match.group(3))
-
-
-def next_version(level: str) -> tuple[str, str]:
-    major, minor, patch = current_version()
-    current = f"{major}.{minor}.{patch}"
-    if level == "major":
-        return current, f"{major + 1}.0.0"
-    if level == "minor":
-        return current, f"{major}.{minor + 1}.0"
-    return current, f"{major}.{minor}.{patch + 1}"
-
-
-def ensure_ready() -> None:
+def ensure_clean_main() -> None:
     branch = run("git", "branch", "--show-current", capture=True)
     if branch != "main":
         fail(f"run from main; the current branch is {branch}")
@@ -86,26 +86,65 @@ def ensure_ready() -> None:
         fail("local main is not up to date with origin/main; run `git pull --ff-only`")
 
 
-def rewrite_files(current: str, version: str) -> None:
-    manifest_path = ROOT / "Cargo.toml"
-    manifest = manifest_path.read_text(encoding="utf-8")
-    updated = manifest.replace(
-        f'version = "{current}"', f'version = "{version}"', 1
-    )
-    if updated == manifest:
-        fail(f"Cargo.toml does not carry version {current}")
-    manifest_path.write_text(updated, encoding="utf-8")
+def preflight(level: str) -> tuple[str, str, str, str]:
+    """Runs every check and content computation before the first write."""
+    ensure_clean_main()
 
-    run("cargo", "update", "--quiet", "--package", "gitveil")
+    manifest = (ROOT / "Cargo.toml").read_text(encoding="utf-8")
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    try:
+        current = package_version(manifest)
+        version = bumped_version(current, level)
+        bumped_manifest = set_package_version(manifest, version)
+        rewritten_readme = rewrite_pinned_downloads(readme, version)
+    except ReleaseVersionError as error:
+        fail(str(error))
 
-    readme_path = ROOT / "README.md"
-    readme = readme_path.read_text(encoding="utf-8")
-    rewritten = PINNED_DOWNLOAD_PATTERN.sub(
-        f"releases/download/v{version}/", readme
-    )
-    if rewritten == readme:
-        fail("README.md carries no pinned installer download links to update")
-    readme_path.write_text(rewritten, encoding="utf-8")
+    branch = f"release/v{version}"
+    if ref_exists(f"refs/heads/{branch}"):
+        fail(f"branch {branch} already exists")
+    if ref_exists(f"refs/tags/v{version}"):
+        fail(f"tag v{version} already exists")
+
+    try:
+        run("cargo", "--version", capture=True)
+    except CommandError:
+        fail("cargo is not available on PATH")
+    try:
+        run("gh", "auth", "status", capture=True)
+    except CommandError:
+        fail("`gh auth status` failed; authenticate with `gh auth login` first")
+
+    return current, version, bumped_manifest, rewritten_readme
+
+
+def write_release_files(bumped_manifest: str, rewritten_readme: str) -> None:
+    """Applies the three-file bump; any failure restores all of them."""
+    try:
+        (ROOT / "Cargo.toml").write_text(bumped_manifest, encoding="utf-8")
+        run("cargo", "update", "--quiet", "--package", "gitveil", capture=True)
+        (ROOT / "README.md").write_text(rewritten_readme, encoding="utf-8")
+    except (CommandError, OSError) as error:
+        restore("git", "checkout", "--", *RELEASE_FILES)
+        fail(f"{error}; Cargo.toml, Cargo.lock, and README.md were rolled back")
+
+
+def publish_branch(branch: str, version: str) -> None:
+    try:
+        run("git", "switch", "-c", branch)
+        run("git", "add", *RELEASE_FILES)
+        run("git", "commit", "-m", f"Bump version to {version}")
+    except CommandError as error:
+        restore("git", "checkout", "--", *RELEASE_FILES)
+        restore("git", "switch", "main")
+        restore("git", "branch", "-D", branch)
+        fail(f"{error}; the working tree and branches were rolled back")
+    try:
+        run("git", "push", "-u", "origin", branch)
+    except CommandError as error:
+        restore("git", "switch", "main")
+        restore("git", "branch", "-D", branch)
+        fail(f"{error}; nothing was pushed and the local branch was removed")
 
 
 def pull_request_body(current: str, version: str) -> str:
@@ -124,6 +163,28 @@ Merging this pull request tags the merge commit automatically and starts the tag
 """
 
 
+def create_pull_request(branch: str, current: str, version: str) -> str:
+    try:
+        return run(
+            "gh",
+            "pr",
+            "create",
+            "--title",
+            f"Bump version to {version}",
+            "--body",
+            pull_request_body(current, version),
+            capture=True,
+        )
+    except CommandError as error:
+        restore("git", "switch", "main")
+        fail(
+            f"{error}; the branch {branch} is already pushed. "
+            f"Retry with `gh pr create --head {branch}`, or abandon the "
+            f"release with `git push origin --delete {branch}` and "
+            f"`git branch -D {branch}`"
+        )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("level", choices=["patch", "minor", "major"])
@@ -134,16 +195,13 @@ def main() -> None:
     )
     arguments = parser.parse_args()
 
-    ensure_ready()
-    current, version = next_version(arguments.level)
+    try:
+        current, version, bumped_manifest, rewritten_readme = preflight(arguments.level)
+    except CommandError as error:
+        fail(str(error))
     branch = f"release/v{version}"
     print(f"current version: {current}")
     print(f"next version:    {version}")
-
-    if ref_exists(f"refs/heads/{branch}"):
-        fail(f"branch {branch} already exists")
-    if ref_exists(f"refs/tags/v{version}"):
-        fail(f"tag v{version} already exists")
 
     if not arguments.yes:
         answer = input(f"create the release pull request for v{version}? [y/N] ")
@@ -151,22 +209,13 @@ def main() -> None:
             print("release preparation cancelled")
             return
 
-    rewrite_files(current, version)
-    run("git", "switch", "-c", branch)
-    run("git", "add", "Cargo.toml", "Cargo.lock", "README.md")
-    run("git", "commit", "-m", f"Bump version to {version}")
-    run("git", "push", "-u", "origin", branch)
-    url = run(
-        "gh",
-        "pr",
-        "create",
-        "--title",
-        f"Bump version to {version}",
-        "--body",
-        pull_request_body(current, version),
-        capture=True,
-    )
-    run("git", "switch", "main")
+    write_release_files(bumped_manifest, rewritten_readme)
+    publish_branch(branch, version)
+    url = create_pull_request(branch, current, version)
+    try:
+        run("git", "switch", "main")
+    except CommandError as error:
+        fail(f"{error}; the pull request exists: {url}")
     print(f"release pull request: {url}")
     print("next: merge the pull request; the tag and release run are automatic.")
     print("then: approve the release environment in Actions to publish.")

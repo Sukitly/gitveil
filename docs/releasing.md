@@ -25,6 +25,8 @@ Repository settings enforce the publication boundary:
 - the `release` environment accepts only `v*` tags and requires maintainer approval before the publish job receives write permission; and
 - GitHub release immutability locks the tag and all assets at publication.
 
+A version tag push builds, attests, and drafts the release without human involvement: draft creation and asset upload are not behind the approval gate. Drafts are invisible to users and carry no immutability, so their assets remain mutable until publication. The `release` environment therefore gates publication only, and the publish job re-derives the facts the approval relies on inside the gate: it downloads every draft asset, checks `SHA256SUMS`, and verifies each artifact attestation before anything goes live.
+
 ## One-time setup
 
 Automatic tagging uses a dedicated credential because tags pushed with the default `GITHUB_TOKEN` do not trigger the tag-driven release workflow:
@@ -57,7 +59,7 @@ The tag-triggered release workflow:
 7. attests all six final assets;
 8. creates a draft release with generated release notes;
 9. waits for approval of the `release` environment; and
-10. verifies the draft still matches the six-asset contract and publishes it.
+10. downloads the draft assets, verifies the six-asset contract, `SHA256SUMS`, and every artifact attestation, and publishes the release.
 
 The workflow refuses to touch a release that is already published.
 
