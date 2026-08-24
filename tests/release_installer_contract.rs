@@ -1,7 +1,8 @@
 pub mod support;
 
+use std::fmt::Write as _;
 use std::fs;
-use std::io::Write;
+use std::io::Write as _;
 use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -336,18 +337,18 @@ fn release_asset_assembler_emits_a_version_pinned_installer_and_manifest() {
         .collect::<Vec<_>>();
     assets.push(installer);
     assets.sort_by_key(|path| path.file_name().map(ToOwned::to_owned));
-    let expected = assets
-        .iter()
-        .map(|path| {
-            format!(
-                "{}  {}\n",
-                digest(path),
-                path.file_name()
-                    .expect("release asset name")
-                    .to_string_lossy()
-            )
-        })
-        .collect::<String>();
+    let mut expected = String::new();
+    for path in &assets {
+        writeln!(
+            expected,
+            "{}  {}",
+            digest(path),
+            path.file_name()
+                .expect("release asset name")
+                .to_string_lossy()
+        )
+        .expect("checksum manifest expectation");
+    }
     assert_eq!(
         fs::read_to_string(fixture.output.join("SHA256SUMS")).expect("checksum manifest"),
         expected
