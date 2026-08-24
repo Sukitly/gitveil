@@ -37,8 +37,8 @@ Preserve these invariants:
 Use targeted commands for local Red/Green feedback. Fetch only the current platform's pinned sidecars when the selected test needs them:
 
 ```bash
-python3 scripts/fetch-test-sops.py
-AGE_KEYGEN_BIN="$(python3 scripts/fetch-test-age.py)" \
+./scripts/fetch-test-sops.py
+AGE_KEYGEN_BIN="$(./scripts/fetch-test-age-keygen.py)" \
   cargo test --test integration_identity
 cargo test open::plan::tests::both_sides_changed_reports_a_conflict_and_keeps_local
 ```

@@ -7,8 +7,8 @@ import argparse
 from pathlib import Path
 import subprocess
 
-from release_package import build_archive
-from sops_artifacts import digest
+from _lib.release_archive import build_archive
+from _lib.sops_artifacts import digest
 
 
 def main() -> int:

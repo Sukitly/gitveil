@@ -18,7 +18,8 @@ Inspect the existing implementation and tests before proposing changes. Do not i
 - Gitveil is one Rust 2024 package with a library and a thin binary.
 - Supported production hosts are macOS and Linux.
 - The Rust version is pinned in `rust-toolchain.toml`.
-- Compatible SOPS and age-keygen builds and artifact checksums are declared in `scripts/sops_artifacts.py` and `scripts/age_artifacts.py`.
+- Compatible SOPS and age-keygen builds and artifact checksums are declared in `scripts/_lib/sops_artifacts.py` and `scripts/_lib/age_keygen_artifacts.py`.
+- Files directly under `scripts/` are executable entry points; import-only Python modules belong under `scripts/_lib/` and must not be executable.
 - `Cargo.toml` intentionally has `publish = false`; do not publish the crate or create releases unless explicitly requested.
 - Keep all tracked text, code comments, tests, commit messages, and pull request content in English.
 - Do not add private keys, plaintext secrets, local absolute paths, generated build output, unpublished planning material, or tool transcripts.
@@ -29,7 +30,7 @@ Inspect the existing implementation and tests before proposing changes. Do not i
 Keep pure policy and transformation code separate from external effects.
 
 - Pure domain modules and feature-local `plan` modules must not access the filesystem, processes, Git, SOPS, environment, network, clock, threads, or randomness.
-- `scripts/check-architecture.py` is the executable declaration of modules that belong to the functional core. Add new pure modules to that declaration rather than bypassing the check.
+- `scripts/check-functional-core.py` is the executable declaration of modules that belong to the functional core. Add new pure modules to that declaration rather than bypassing the check.
 - `src/source/` owns typed and lossless source parsing and rendering.
 - `src/semantic/` owns pure semantic diff and merge behavior.
 - `src/git/`, `src/sops/`, `src/age.rs`, and `src/runtime/` contain external adapters.
@@ -95,7 +96,7 @@ Do not change test expectations merely to make a gate pass. Fix the implementati
 - Update `README.md` when commands, configuration, installation, security boundaries, or release layout change.
 - Update `docs/getting-started.md` when the first-use path changes.
 - Update `CONTRIBUTING.md` when contributor tooling or quality gates change.
-- Keep relative links in public Markdown valid; `scripts/check-docs.py` enforces them.
+- Keep relative links in public Markdown valid; `scripts/check-doc-links.py` enforces them.
 - Keep dependency changes intentional and locked. Explain why a new runtime dependency belongs at its architectural boundary.
 - Preserve third-party license files and notices in release archives.
 

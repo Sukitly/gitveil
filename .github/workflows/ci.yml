@@ -52,11 +52,11 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
 
-      - name: Check architecture boundaries
-        run: python3 scripts/check-architecture.py
+      - name: Check functional-core boundaries
+        run: ./scripts/check-functional-core.py
 
-      - name: Check public documentation
-        run: python3 scripts/check-docs.py
+      - name: Check documentation links
+        run: ./scripts/check-doc-links.py
 
       - name: Run Clippy
         run: cargo clippy --all-targets --all-features --locked -- -D warnings
@@ -125,9 +125,9 @@ jobs:
 
       - name: Fetch checksum-pinned test sidecars
         run: |
-          sops_bin="$(python3 scripts/fetch-test-sops.py)"
-          age_keygen_bin="$(python3 scripts/fetch-test-age.py)"
-          age_keygen_archive="$(python3 scripts/fetch-test-age.py --print-archive)"
+          sops_bin="$(./scripts/fetch-test-sops.py)"
+          age_keygen_bin="$(./scripts/fetch-test-age-keygen.py)"
+          age_keygen_archive="$(./scripts/fetch-test-age-keygen.py --print-archive)"
           {
             echo "SOPS_BIN=$sops_bin"
             echo "AGE_KEYGEN_BIN=$age_keygen_bin"
@@ -142,7 +142,7 @@ jobs:
 
       - name: Validate the native release package
         run: |
-          python3 scripts/package-release.py \
+          ./scripts/build-release-archive.py \
             --skip-build \
             --binary target/release/gitveil \
             --sops-bin "$SOPS_BIN" \

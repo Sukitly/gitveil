@@ -17,13 +17,13 @@ Gitveil does not require a system SOPS or age executable. Release archives inclu
 Install from a source checkout for the current user:
 
 ```bash
-./scripts/install-local.py
+./scripts/install-from-source.py
 ```
 
 The default prefix is `${CARGO_HOME:-$HOME/.cargo}`. To select another prefix:
 
 ```bash
-./scripts/install-local.py --prefix ~/.local
+./scripts/install-from-source.py --prefix ~/.local
 ```
 
 The installer performs a locked release build, fetches and verifies official SOPS 3.13.3 and age-keygen 1.3.1 artifacts, validates the complete release archive, and transactionally installs the binary, private sidecars, and license files. Do not use `cargo install --path .`: Cargo installs only the binary and omits the private sidecars.
@@ -31,7 +31,7 @@ The installer performs a locked release build, fetches and verifies official SOP
 The user-facing installation unit is a native release archive. Maintainers build one on each target platform with:
 
 ```bash
-python3 scripts/package-release.py
+./scripts/build-release-archive.py
 ```
 
 The archive is written to `dist/gitveil-v<version>-<os>-<arch>.tar.gz` with this layout:

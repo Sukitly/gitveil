@@ -10,12 +10,11 @@ use support::{
     command_output, sops_binary,
 };
 
-fn installer_command() -> Command {
+fn source_installer_command() -> Command {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let mut command = Command::new("python3");
+    let mut command = Command::new(root.join("scripts/install-from-source.py"));
     command
         .current_dir(root)
-        .arg("scripts/install-local.py")
         .arg("--skip-build")
         .arg("--binary")
         .arg(assert_cmd::cargo::cargo_bin!("gitveil"))
@@ -127,33 +126,33 @@ fn assert_installed_layout(prefix: &Path) {
 }
 
 #[test]
-fn local_installer_defaults_to_cargo_home_and_installs_the_complete_layout() {
+fn source_installer_defaults_to_cargo_home_and_installs_the_complete_layout() {
     let temporary = tempfile::tempdir().expect("installer fixture");
     let cargo_home = temporary.path().join("cargo-home");
     let output = command_output(
-        installer_command()
+        source_installer_command()
             .env("HOME", temporary.path())
             .env("CARGO_HOME", &cargo_home),
     );
-    assert_success(output, "default local install");
+    assert_success(output, "default source install");
     assert_installed_layout(&cargo_home);
 }
 
 #[test]
-fn local_installer_honors_a_custom_prefix_and_can_replace_an_existing_install() {
+fn source_installer_honors_a_custom_prefix_and_can_replace_an_existing_install() {
     let temporary = tempfile::tempdir().expect("installer fixture");
     let cargo_home = temporary.path().join("unused-cargo-home");
     let prefix = temporary.path().join("custom-prefix");
 
     for _ in 0..2 {
         let output = command_output(
-            installer_command()
+            source_installer_command()
                 .env("HOME", temporary.path())
                 .env("CARGO_HOME", &cargo_home)
                 .arg("--prefix")
                 .arg(&prefix),
         );
-        assert_success(output, "custom local install");
+        assert_success(output, "custom source install");
     }
 
     assert_installed_layout(&prefix);
@@ -164,7 +163,7 @@ fn local_installer_honors_a_custom_prefix_and_can_replace_an_existing_install() 
 }
 
 #[test]
-fn local_installer_rejects_a_directory_destination_without_partial_replacement() {
+fn source_installer_rejects_a_directory_destination_without_partial_replacement() {
     let temporary = tempfile::tempdir().expect("installer fixture");
     let prefix = temporary.path().join("prefix");
     let existing_sidecar = prefix.join("libexec/gitveil/sops");
@@ -174,7 +173,7 @@ fn local_installer_rejects_a_directory_destination_without_partial_replacement()
     fs::create_dir_all(prefix.join("bin/gitveil")).expect("create conflicting directory");
 
     let output = command_output(
-        installer_command()
+        source_installer_command()
             .env("HOME", temporary.path())
             .arg("--prefix")
             .arg(&prefix),
@@ -207,7 +206,7 @@ fn release_packaging_rejects_a_sidecar_with_the_wrong_checksum_without_an_archiv
         Command::new("python3")
             .current_dir(root)
             .env("PYTHONDONTWRITEBYTECODE", "1")
-            .arg("scripts/package-release.py")
+            .arg("scripts/build-release-archive.py")
             .arg("--skip-build")
             .arg("--binary")
             .arg(assert_cmd::cargo::cargo_bin!("gitveil"))
@@ -244,7 +243,7 @@ fn release_packaging_rejects_a_supplied_age_keygen_without_its_verified_archive(
             .current_dir(root)
             .env("PYTHONDONTWRITEBYTECODE", "1")
             .env("https_proxy", "http://127.0.0.1:9")
-            .arg("scripts/package-release.py")
+            .arg("scripts/build-release-archive.py")
             .arg("--skip-build")
             .arg("--binary")
             .arg(assert_cmd::cargo::cargo_bin!("gitveil"))
@@ -275,7 +274,7 @@ fn release_packaging_rejects_an_age_keygen_with_the_wrong_checksum() {
         Command::new("python3")
             .current_dir(root)
             .env("PYTHONDONTWRITEBYTECODE", "1")
-            .arg("scripts/package-release.py")
+            .arg("scripts/build-release-archive.py")
             .arg("--skip-build")
             .arg("--binary")
             .arg(assert_cmd::cargo::cargo_bin!("gitveil"))
@@ -312,7 +311,7 @@ fn release_packaging_rejects_an_unverified_age_archive() {
             .current_dir(root)
             .env("PYTHONDONTWRITEBYTECODE", "1")
             .env("https_proxy", "http://127.0.0.1:9")
-            .arg("scripts/package-release.py")
+            .arg("scripts/build-release-archive.py")
             .arg("--skip-build")
             .arg("--binary")
             .arg(assert_cmd::cargo::cargo_bin!("gitveil"))
