@@ -13,12 +13,12 @@ mod plan;
 
 pub(crate) use plan::ciphertext_has_conflict_markers;
 
-use crate::recipient::RecipientAction;
-use plan::{SealAction, SealBaseline, plan_seal, resembles_envelope, result_matches};
+use crate::recipient::RecipientSetDiff;
+use plan::{SealAction, plan_seal, resembles_envelope, result_matches};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SealOutcome {
-    Sealed { data_key_rotated: bool },
+    Sealed,
     Unchanged,
 }
 
@@ -93,23 +93,29 @@ fn seal_entry(
                 .map_err(|error| GitveilError::ciphertext(&cipher_path, &error.to_string()))
         })
         .transpose()?;
-    // Every alignment direction requires decrypting the existing ciphertext,
+    // Seal is a data command and never changes authorization: any recipient
+    // drift fails closed here, keyless, before any decryption or effect.
+    // Authorization changes only through `gitveil recipient add/remove`.
+    match &baseline_envelope {
+        Some(envelope) => {
+            let drift = entry.recipient_policy().diff(envelope.age_recipients());
+            if !drift.is_empty() {
+                return Err(recipient_drift_error(&cipher_path, entry, drift));
+            }
+        }
+        // A first seal has no envelope to anchor authorization, so the
+        // policy's other existing ciphertexts serve as the anchor: drift
+        // there blocks encrypting new files to a possibly tampered policy.
+        None => ensure_policy_ciphertexts_aligned(workspace, entry)?,
+    }
+    // The incremental edit path requires decrypting the existing ciphertext,
     // so an unavailable identity fails here without touching any file; seal
     // never blindly rebuilds ciphertext it cannot read.
     let baseline_document = baseline_bytes
         .as_deref()
         .map(|bytes| decrypt_source(sops, bytes, entry))
         .transpose()?;
-    let plan = plan_seal(
-        &desired,
-        baseline_envelope
-            .as_ref()
-            .zip(baseline_document.as_ref())
-            .map(|(envelope, document)| SealBaseline {
-                document,
-                recipient_drift: entry.recipient_policy().diff(envelope.age_recipients()),
-            }),
-    );
+    let action = plan_seal(&desired, baseline_document.as_ref());
 
     let baseline_ciphertext = || {
         baseline_bytes.as_deref().ok_or_else(|| {
@@ -119,36 +125,79 @@ fn seal_entry(
             )
         })
     };
-    let mut ciphertext = match plan.action {
-        // First-time seal and rotation both encrypt the desired plaintext
-        // directly to the policy; a rotation's fresh data key is what makes
-        // the exclusion real, and pending edits ride along in the same commit
-        // without ever touching the old key.
+    let ciphertext = match action {
         SealAction::EncryptNew => sops.encrypt_new(
             &desired_envelope(&desired, path)?,
             path,
             entry.recipient_policy(),
         )?,
-        SealAction::PreserveBaseline => baseline_ciphertext()?.to_vec(),
+        SealAction::PreserveBaseline => {
+            // Aligned and semantically unchanged: byte-idempotent.
+            update_baseline(store, entry, &desired, baseline_ciphertext()?)?;
+            return Ok(SealOutcome::Unchanged);
+        }
         SealAction::EditExisting => sops.edit(
             baseline_ciphertext()?,
             &desired_envelope(&desired, path)?,
             path,
         )?,
     };
-    if plan.recipient_action == RecipientAction::Rewrap {
-        ciphertext = rewrap_updatekeys(sops, &ciphertext, entry)?;
-    } else if matches!(plan.action, SealAction::PreserveBaseline) {
-        // Aligned and semantically unchanged: byte-idempotent.
-        update_baseline(store, entry, &desired, &ciphertext)?;
-        return Ok(SealOutcome::Unchanged);
-    }
     verify_result(sops, &ciphertext, &desired, entry)?;
     workspace.write_ciphertext(&cipher_path, &ciphertext)?;
     update_baseline(store, entry, &desired, &ciphertext)?;
-    Ok(SealOutcome::Sealed {
-        data_key_rotated: matches!(plan.recipient_action, RecipientAction::Rotate),
-    })
+    Ok(SealOutcome::Sealed)
+}
+
+fn recipient_drift_error(
+    cipher_path: &ManagedPath,
+    entry: &ResolvedManifestEntry<'_>,
+    drift: RecipientSetDiff,
+) -> GitveilError {
+    GitveilError::configuration(format!(
+        "{cipher_path} recipient set differs from policy {} (add {}, remove {}); \
+         data commands never change authorization; run gitveil recipient add or \
+         gitveil recipient remove first",
+        entry.recipient_policy().name(),
+        drift.added,
+        drift.removed
+    ))
+}
+
+/// First-seal policy cross-check: every other existing ciphertext under the
+/// same policy must be aligned before a new file is encrypted to it.
+fn ensure_policy_ciphertexts_aligned(
+    workspace: &Workspace,
+    entry: &ResolvedManifestEntry<'_>,
+) -> Result<()> {
+    for other in workspace.manifest().entries() {
+        if other.path() == entry.path()
+            || other.recipient_policy() != entry.recipient_policy().name()
+        {
+            continue;
+        }
+        let cipher = other.ciphertext_path();
+        let Some(bytes) = workspace.read(&cipher)? else {
+            continue;
+        };
+        let envelope = CiphertextEnvelope::parse(&bytes, other.format()).map_err(|error| {
+            GitveilError::ciphertext(
+                &cipher,
+                &format!("cannot verify policy alignment before a first seal: {error}"),
+            )
+        })?;
+        let drift = entry.recipient_policy().diff(envelope.age_recipients());
+        if !drift.is_empty() {
+            return Err(GitveilError::configuration(format!(
+                "policy {} has drifted ciphertext at {cipher} (add {}, remove {}); \
+                 run gitveil recipient add or gitveil recipient remove before \
+                 sealing new files under this policy",
+                entry.recipient_policy().name(),
+                drift.added,
+                drift.removed
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn update_baseline(
@@ -218,46 +267,7 @@ fn verify_result(
     Ok(())
 }
 
-/// Rewraps the same data key to the entry policy via `updatekeys` and
-/// verifies every encrypted leaf stayed byte-for-byte stable.
-///
-/// This handles additions only; a removal must instead re-encrypt from its
-/// plaintext truth source under a fresh data key.
-pub(crate) fn rewrap_updatekeys(
-    sops: &SopsClient,
-    ciphertext: &[u8],
-    entry: &ResolvedManifestEntry<'_>,
-) -> Result<Vec<u8>> {
-    let rewrapped = sops.rewrap(ciphertext, entry.recipient_policy())?;
-    verify_rewrap_result(ciphertext, &rewrapped, entry)?;
-    Ok(rewrapped)
-}
-
-fn verify_rewrap_result(
-    before: &[u8],
-    after: &[u8],
-    entry: &ResolvedManifestEntry<'_>,
-) -> Result<()> {
-    let before = CiphertextEnvelope::parse(before, entry.format())
-        .map_err(|error| GitveilError::ciphertext(entry.path(), &error.to_string()))?;
-    let after = CiphertextEnvelope::parse(after, entry.format())
-        .map_err(|error| GitveilError::ciphertext(entry.path(), &error.to_string()))?;
-    verify_recipient_policy(&after, entry)?;
-    if before.leaf_ciphertexts() != after.leaf_ciphertexts()
-        || before.layout_ciphertext() != after.layout_ciphertext()
-    {
-        return Err(GitveilError::new(
-            ErrorCategory::Integrity,
-            format!(
-                "SOPS recipient update changed encrypted data at {}",
-                entry.path()
-            ),
-        ));
-    }
-    Ok(())
-}
-
-pub(crate) fn verify_recipient_policy(
+fn verify_recipient_policy(
     envelope: &CiphertextEnvelope,
     entry: &ResolvedManifestEntry<'_>,
 ) -> Result<()> {

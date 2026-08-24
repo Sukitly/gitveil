@@ -10,12 +10,20 @@ fn binary() -> std::path::PathBuf {
 }
 
 #[test]
-fn help_lists_exactly_the_eight_public_commands() {
+fn help_lists_exactly_the_nine_public_commands() {
     let output = command_output(Command::new(binary()).arg("--help"));
     assert_eq!(output.status.code(), Some(0));
     let help = String::from_utf8(output.stdout).expect("help UTF-8");
     for command in [
-        "identity", "init", "add", "open", "seal", "status", "verify", "resolve",
+        "identity",
+        "init",
+        "add",
+        "recipient",
+        "open",
+        "seal",
+        "status",
+        "verify",
+        "resolve",
     ] {
         assert!(help.contains(command), "help must list {command}: {help}");
     }
@@ -61,6 +69,38 @@ fn identity_help_lists_generation_and_recipient_derivation() {
     assert!(normalized.contains("SOPS_AGE_KEY_FILE"));
     assert!(normalized.contains("platform default key file"));
     assert!(!normalized.contains("SOPS_AGE_KEY_CMD"));
+}
+
+#[test]
+fn recipient_help_names_the_explicit_authorization_surface() {
+    let output = command_output(Command::new(binary()).args(["recipient", "--help"]));
+    assert_eq!(output.status.code(), Some(0));
+    let help = String::from_utf8(output.stdout).expect("recipient help UTF-8");
+    assert!(
+        help.lines()
+            .any(|line| line.trim_start().starts_with("add"))
+    );
+    assert!(
+        help.lines()
+            .any(|line| line.trim_start().starts_with("remove"))
+    );
+
+    for subcommand in ["add", "remove"] {
+        let output =
+            command_output(Command::new(binary()).args(["recipient", subcommand, "--help"]));
+        assert_eq!(output.status.code(), Some(0));
+        let help = String::from_utf8_lossy(&output.stdout);
+        assert!(help.contains("--policy"), "{subcommand} help: {help}");
+        // Recipients are the positional direct object, not a flag.
+        assert!(help.contains("AGE_RECIPIENT"), "{subcommand} help: {help}");
+        assert!(!help.contains("--recipient"), "{subcommand} help: {help}");
+    }
+
+    // The recipient is the required, explicit authorization statement.
+    for subcommand in ["add", "remove"] {
+        let output = command_output(Command::new(binary()).args(["recipient", subcommand]));
+        assert_eq!(output.status.code(), Some(2), "{subcommand} without value");
+    }
 }
 
 #[test]

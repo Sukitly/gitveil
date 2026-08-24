@@ -43,7 +43,7 @@ gitveil init \
   --recipient age1bob...
 ```
 
-Recipients in one policy provide OR authorization: any matching identity can decrypt. Removing or rotating a current recipient cannot revoke access to ciphertext already present in Git history.
+Recipients in one policy provide OR authorization: any matching identity can decrypt. After initialization, membership changes only through the explicit authorization commands: `gitveil recipient add age1...` grants access and rewraps every affected ciphertext, and `gitveil recipient remove age1...` revokes access and rotates each file's data key. Each command converges only the recipients it names; editing `.gitveilrc.json` by hand grants nothing, and the remaining difference blocks `seal` until a recipient command names it. Removing or rotating a current recipient cannot revoke access to ciphertext already present in Git history.
 
 ## Complete repository flow
 

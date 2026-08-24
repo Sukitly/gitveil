@@ -141,34 +141,9 @@ pub struct RecipientSetDiff {
     pub(crate) removed: usize,
 }
 
-/// How an envelope's recipient set is brought to a policy.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum RecipientAction {
-    /// The sets already agree.
-    Aligned,
-    /// Only additions are needed: the same data key is rewrapped and every
-    /// encrypted leaf stays byte-for-byte stable.
-    Rewrap,
-    /// The envelope carries a recipient outside the policy. Exclusion is only
-    /// real under a data key the removed party cannot unwrap, so the envelope
-    /// must be re-encrypted under a fresh one.
-    Rotate,
-}
-
 impl RecipientSetDiff {
     pub(crate) const fn is_empty(self) -> bool {
         self.added == 0 && self.removed == 0
-    }
-
-    /// Any removal forces a fresh data key; additions alone rewrap.
-    pub(crate) const fn action(self) -> RecipientAction {
-        if self.removed > 0 {
-            RecipientAction::Rotate
-        } else if self.added > 0 {
-            RecipientAction::Rewrap
-        } else {
-            RecipientAction::Aligned
-        }
     }
 }
 
@@ -189,16 +164,15 @@ pub enum RecipientError {
 #[cfg(test)]
 mod tests {
 
-    use super::{AgeRecipient, RecipientAction, RecipientError, RecipientSetDiff};
+    use super::{AgeRecipient, RecipientError, RecipientSetDiff};
 
     #[test]
-    fn set_diff_action_rotates_on_any_removal_and_rewraps_on_additions_only() {
+    fn set_diff_emptiness_reflects_both_directions() {
         let drift = |added, removed| RecipientSetDiff { added, removed };
-        assert_eq!(drift(0, 0).action(), RecipientAction::Aligned);
-        assert_eq!(drift(1, 0).action(), RecipientAction::Rewrap);
-        assert_eq!(drift(0, 1).action(), RecipientAction::Rotate);
-        // Mixed additions and removals (including a policy switch) rotate.
-        assert_eq!(drift(2, 1).action(), RecipientAction::Rotate);
+        assert!(drift(0, 0).is_empty());
+        assert!(!drift(1, 0).is_empty());
+        assert!(!drift(0, 1).is_empty());
+        assert!(!drift(2, 1).is_empty());
     }
 
     /// HRP `age`, 32-byte payload, bech32 checksum: the only shape age accepts.

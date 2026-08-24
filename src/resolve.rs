@@ -7,8 +7,8 @@ use crate::envelope::{CiphertextEnvelope, DecryptedEnvelope};
 use crate::error::{ErrorCategory, GitveilError, Result, SecretBytes};
 use crate::manifest::ResolvedManifestEntry;
 use crate::path::ManagedPath;
-use crate::recipient::RecipientAction;
-use crate::seal::{decrypt_source, rewrap_updatekeys, verify_recipient_policy};
+use crate::recipient::{AgeRecipient, AgeRecipientPolicy};
+use crate::seal::decrypt_source;
 use crate::sops::SopsClient;
 use crate::source::{Layout, LineEnding, Node, NodePath, SourceDocument};
 use crate::workspace::Workspace;
@@ -22,7 +22,13 @@ const MARKER_SIZE: usize = 7;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ResolveOutcome {
     /// The merge was completed; ciphertext and plaintext were rewritten.
-    Resolved { data_key_rotated: bool },
+    /// `data_key_rotated` reports that policy-removed recipients were
+    /// excluded from the merged envelope under a fresh data key;
+    /// `recipient_drift` reports pending additions for `gitveil recipient`.
+    Resolved {
+        data_key_rotated: bool,
+        recipient_drift: bool,
+    },
     /// Same-key conflicts remain: the plaintext holds a conflict document to
     /// edit, the working ciphertext was normalized to the local (ours) side,
     /// and `gitveil seal` finishes the resolution.
@@ -101,30 +107,47 @@ fn resolve_entry(
                 .and_then(|envelope| envelope.to_yaml())
                 .map(SecretBytes::new)
                 .map_err(|error| GitveilError::ciphertext(path, &error.to_string()))?;
-            // The alignment direction is decided from the ours-side envelope
-            // an edit would preserve. A removal re-encrypts the
-            // merged result directly under a fresh data key the removed party
-            // cannot unwrap; the old key never touches the merged values.
+            // Resolve is a data command: it never extends access. The merged
+            // content (which includes theirs-side values) is encrypted to the
+            // intersection of the ours-side envelope set and the policy, so a
+            // policy-removed recipient never gains the merged values, and no
+            // recipient outside the ours envelope is granted anything.
+            // Pending additions stay for `gitveil recipient add`.
             let ours_envelope = CiphertextEnvelope::parse(ours, entry.format())
                 .map_err(|error| GitveilError::ciphertext(path, &error.to_string()))?;
-            let recipient_action = entry
-                .recipient_policy()
-                .diff(ours_envelope.age_recipients())
-                .action();
-            let data_key_rotated = matches!(recipient_action, RecipientAction::Rotate);
-            let ciphertext = match recipient_action {
-                RecipientAction::Rotate => {
-                    sops.encrypt_new(&desired, path, entry.recipient_policy())?
-                }
-                RecipientAction::Aligned => sops.edit(ours, &desired, path)?,
-                RecipientAction::Rewrap => {
-                    let edited = sops.edit(ours, &desired, path)?;
-                    rewrap_updatekeys(sops, &edited, entry)?
-                }
+            let policy_recipients = entry.recipient_policy().recipients();
+            let target = ours_envelope
+                .age_recipients()
+                .iter()
+                .filter(|recipient| policy_recipients.contains(recipient))
+                .cloned()
+                .collect::<Vec<_>>();
+            if target.is_empty() {
+                return Err(GitveilError::configuration(format!(
+                    "no recipient of {cipher_path} remains in policy {}; converge \
+                     authorization with gitveil recipient before resolving",
+                    entry.recipient_policy().name()
+                )));
+            }
+            let data_key_rotated = target.len() != ours_envelope.age_recipients().len();
+            let ciphertext = if data_key_rotated {
+                let narrowed = AgeRecipientPolicy::new(
+                    entry.recipient_policy().name().clone(),
+                    target.clone(),
+                )
+                .map_err(|error| {
+                    GitveilError::new(
+                        ErrorCategory::Integrity,
+                        format!("narrowed recipient set is invalid at {path}: {error}"),
+                    )
+                })?;
+                sops.encrypt_new(&desired, path, &narrowed)?
+            } else {
+                sops.edit(ours, &desired, path)?
             };
             let envelope = CiphertextEnvelope::parse(&ciphertext, entry.format())
                 .map_err(|error| GitveilError::ciphertext(path, &error.to_string()))?;
-            verify_recipient_policy(&envelope, entry)?;
+            verify_recipients_exact(&envelope, &target, path)?;
             let verified = decrypt_source(sops, &ciphertext, entry)?;
             if !verified.semantic_eq(&merged) {
                 return Err(GitveilError::new(
@@ -145,7 +168,14 @@ fn resolve_entry(
                 );
                 store.save(path, &record)?;
             }
-            Ok(ResolveOutcome::Resolved { data_key_rotated })
+            let recipient_drift = !entry
+                .recipient_policy()
+                .diff(envelope.age_recipients())
+                .is_empty();
+            Ok(ResolveOutcome::Resolved {
+                data_key_rotated,
+                recipient_drift,
+            })
         }
         MergePlan::Conflict {
             path: node,
@@ -159,6 +189,31 @@ fn resolve_entry(
             Ok(ResolveOutcome::ConflictWritten(node))
         }
     }
+}
+
+/// The merged envelope's recipient set must equal the computed narrowed
+/// target exactly: nothing outside the ours envelope, nothing the policy
+/// already removed.
+fn verify_recipients_exact(
+    envelope: &CiphertextEnvelope,
+    target: &[AgeRecipient],
+    path: &ManagedPath,
+) -> Result<()> {
+    let mut actual = envelope
+        .age_recipients()
+        .iter()
+        .map(AgeRecipient::as_str)
+        .collect::<Vec<_>>();
+    let mut expected = target.iter().map(AgeRecipient::as_str).collect::<Vec<_>>();
+    actual.sort_unstable();
+    expected.sort_unstable();
+    if actual == expected {
+        return Ok(());
+    }
+    Err(GitveilError::new(
+        ErrorCategory::Integrity,
+        format!("merge produced an envelope outside the narrowed recipient set at {path}"),
+    ))
 }
 
 fn decrypt_stage(

@@ -153,41 +153,12 @@ impl Workspace {
 
     /// Atomically writes a plaintext file with owner-only permissions.
     pub(crate) fn write_plaintext(&self, path: &ManagedPath, bytes: &[u8]) -> Result<()> {
-        self.write(path, bytes, 0o600)
+        write_managed_file(&self.root, path, bytes, 0o600)
     }
 
     /// Atomically writes a ciphertext file with conventional permissions.
     pub(crate) fn write_ciphertext(&self, path: &ManagedPath, bytes: &[u8]) -> Result<()> {
-        self.write(path, bytes, 0o644)
-    }
-
-    fn write(&self, path: &ManagedPath, bytes: &[u8], mode: u32) -> Result<()> {
-        use std::os::unix::fs::PermissionsExt;
-
-        confine::validate_managed_path(&self.root, path)?;
-        let target = path.join_to(&self.root);
-        let parent = target
-            .parent()
-            .ok_or_else(|| GitveilError::configuration("workspace path has no parent"))?;
-        let mut temporary = tempfile::NamedTempFile::new_in(parent).map_err(|error| {
-            GitveilError::io(
-                "create workspace replacement",
-                Some(parent.to_path_buf()),
-                &error,
-            )
-        })?;
-        temporary
-            .as_file()
-            .set_permissions(fs::Permissions::from_mode(mode))
-            .and_then(|()| temporary.write_all(bytes))
-            .and_then(|()| temporary.as_file_mut().sync_all())
-            .map_err(|error| {
-                GitveilError::io("write workspace file", Some(target.clone()), &error)
-            })?;
-        temporary.persist(&target).map_err(|error| {
-            GitveilError::io("replace workspace file", Some(target), &error.error)
-        })?;
-        Ok(())
+        write_ciphertext_file(&self.root, path, bytes)
     }
 
     /// Baseline store; `None` outside a Git repository (conservative mode).
@@ -214,6 +185,39 @@ impl Workspace {
     pub(crate) fn lock(&self) -> Result<OperationLock> {
         acquire_lock(&self.runtime, LOCK_TIMEOUT)
     }
+}
+
+/// Single source of the ciphertext write policy (mode `0644`, confinement,
+/// atomic replacement) for every writer of managed ciphertext files.
+pub(crate) fn write_ciphertext_file(root: &Path, path: &ManagedPath, bytes: &[u8]) -> Result<()> {
+    write_managed_file(root, path, bytes, 0o644)
+}
+
+fn write_managed_file(root: &Path, path: &ManagedPath, bytes: &[u8], mode: u32) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    confine::validate_managed_path(root, path)?;
+    let target = path.join_to(root);
+    let parent = target
+        .parent()
+        .ok_or_else(|| GitveilError::configuration("workspace path has no parent"))?;
+    let mut temporary = tempfile::NamedTempFile::new_in(parent).map_err(|error| {
+        GitveilError::io(
+            "create workspace replacement",
+            Some(parent.to_path_buf()),
+            &error,
+        )
+    })?;
+    temporary
+        .as_file()
+        .set_permissions(fs::Permissions::from_mode(mode))
+        .and_then(|()| temporary.write_all(bytes))
+        .and_then(|()| temporary.as_file_mut().sync_all())
+        .map_err(|error| GitveilError::io("write workspace file", Some(target.clone()), &error))?;
+    temporary
+        .persist(&target)
+        .map_err(|error| GitveilError::io("replace workspace file", Some(target), &error.error))?;
+    Ok(())
 }
 
 fn find_manifest_root(start: &Path) -> Result<PathBuf> {

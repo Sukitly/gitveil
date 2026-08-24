@@ -1,8 +1,10 @@
-//!
 //! Pure seal policy: turns the desired document and the decrypted state of
-//! the existing ciphertext into a directly executable plan.
+//! the existing ciphertext into a directly executable action.
+//!
+//! Recipient drift never reaches this plan: `seal` is a data command and
+//! fails closed on any manifest/envelope recipient difference before
+//! decrypting; authorization changes only through `gitveil recipient`.
 
-use crate::recipient::{RecipientAction, RecipientSetDiff};
 use crate::source::SourceDocument;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -12,47 +14,12 @@ pub(super) enum SealAction {
     EditExisting,
 }
 
-/// The decrypted state of an existing ciphertext: its semantic document and
-/// its recipient drift against the entry policy.
-pub(super) struct SealBaseline<'a> {
-    pub document: &'a SourceDocument,
-    pub recipient_drift: RecipientSetDiff,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) struct SealPlan {
-    /// The executable action. Never contradicted by `recipient_action`: a
-    /// rotation collapses to [`SealAction::EncryptNew`] here.
-    pub action: SealAction,
-    pub recipient_action: RecipientAction,
-}
-
-pub(super) fn plan_seal(desired: &SourceDocument, baseline: Option<SealBaseline<'_>>) -> SealPlan {
-    let Some(baseline) = baseline else {
-        // No envelope exists: there is no recipient set to align and
-        // `EncryptNew` encrypts directly to the policy.
-        return SealPlan {
-            action: SealAction::EncryptNew,
-            recipient_action: RecipientAction::Aligned,
-        };
-    };
-    let recipient_action = baseline.recipient_drift.action();
-    let action = match recipient_action {
-        // Exclusion re-encrypts the desired plaintext under a fresh data key,
-        // so the executable action is a new envelope regardless of
-        // whether the content changed.
-        RecipientAction::Rotate => SealAction::EncryptNew,
-        RecipientAction::Aligned | RecipientAction::Rewrap => {
-            if desired.semantic_eq(baseline.document) {
-                SealAction::PreserveBaseline
-            } else {
-                SealAction::EditExisting
-            }
-        }
-    };
-    SealPlan {
-        action,
-        recipient_action,
+pub(super) fn plan_seal(desired: &SourceDocument, baseline: Option<&SourceDocument>) -> SealAction {
+    match baseline {
+        // No envelope exists: encrypt directly to the policy.
+        None => SealAction::EncryptNew,
+        Some(existing) if desired.semantic_eq(existing) => SealAction::PreserveBaseline,
+        Some(_) => SealAction::EditExisting,
     }
 }
 
@@ -82,25 +49,15 @@ pub(crate) fn ciphertext_has_conflict_markers(input: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use crate::config::SourceFormat;
+    use crate::source::SourceDocument;
     use crate::source::parse;
 
-    use crate::recipient::{RecipientAction, RecipientSetDiff};
-    use crate::source::SourceDocument;
-
     use super::{
-        SealAction, SealBaseline, SealPlan, ciphertext_has_conflict_markers, plan_seal,
-        resembles_envelope, result_matches,
+        SealAction, ciphertext_has_conflict_markers, plan_seal, resembles_envelope, result_matches,
     };
 
     fn document(value: &str) -> SourceDocument {
         parse(SourceFormat::Dotenv, format!("A={value}\n").as_bytes()).expect("document")
-    }
-
-    const fn baseline(document: &SourceDocument, added: usize, removed: usize) -> SealBaseline<'_> {
-        SealBaseline {
-            document,
-            recipient_drift: RecipientSetDiff { added, removed },
-        }
     }
 
     #[test]
@@ -108,64 +65,14 @@ mod tests {
         let desired = document("desired");
         let same = document("desired");
         let changed = document("baseline");
+        assert_eq!(plan_seal(&desired, None), SealAction::EncryptNew);
         assert_eq!(
-            plan_seal(&desired, None),
-            SealPlan {
-                action: SealAction::EncryptNew,
-                recipient_action: RecipientAction::Aligned,
-            }
+            plan_seal(&desired, Some(&same)),
+            SealAction::PreserveBaseline
         );
         assert_eq!(
-            plan_seal(&desired, Some(baseline(&same, 0, 0))),
-            SealPlan {
-                action: SealAction::PreserveBaseline,
-                recipient_action: RecipientAction::Aligned,
-            }
-        );
-        assert_eq!(
-            plan_seal(&desired, Some(baseline(&changed, 0, 0))),
-            SealPlan {
-                action: SealAction::EditExisting,
-                recipient_action: RecipientAction::Aligned,
-            }
-        );
-    }
-
-    #[test]
-    fn recipient_drift_shapes_the_executable_action() {
-        let desired = document("desired");
-        let same = document("desired");
-        let changed = document("old");
-        // Additions keep the incremental action; only the alignment differs.
-        assert_eq!(
-            plan_seal(&desired, Some(baseline(&same, 1, 0))),
-            SealPlan {
-                action: SealAction::PreserveBaseline,
-                recipient_action: RecipientAction::Rewrap,
-            }
-        );
-        assert_eq!(
-            plan_seal(&desired, Some(baseline(&changed, 1, 0))),
-            SealPlan {
-                action: SealAction::EditExisting,
-                recipient_action: RecipientAction::Rewrap,
-            }
-        );
-        // Any removal collapses to EncryptNew, even with unchanged content:
-        // the executable action never contradicts the rotation.
-        assert_eq!(
-            plan_seal(&desired, Some(baseline(&same, 0, 1))),
-            SealPlan {
-                action: SealAction::EncryptNew,
-                recipient_action: RecipientAction::Rotate,
-            }
-        );
-        assert_eq!(
-            plan_seal(&desired, Some(baseline(&changed, 1, 1))),
-            SealPlan {
-                action: SealAction::EncryptNew,
-                recipient_action: RecipientAction::Rotate,
-            }
+            plan_seal(&desired, Some(&changed)),
+            SealAction::EditExisting
         );
     }
 

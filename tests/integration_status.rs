@@ -208,7 +208,12 @@ fn status_reports_recipient_drift_alongside_data_state() {
     assert!(stdout.contains("policy team"), "stdout: {stdout}");
     assert!(stdout.contains("add 1"), "stdout: {stdout}");
     assert!(stdout.contains("remove 0"), "stdout: {stdout}");
-    // Additions rewrap in place; only removals rotate the data key.
+    // Data commands fail closed on drift; status points to the
+    // authorization command, and only removals rotate the data key.
+    assert!(
+        stdout.contains("run gitveil recipient add"),
+        "stdout: {stdout}"
+    );
     assert!(
         !stdout.contains("rotates the file data key"),
         "stdout: {stdout}"
@@ -226,10 +231,16 @@ fn status_reports_recipient_drift_alongside_data_state() {
     assert!(stdout.contains("local edits"), "stdout: {stdout}");
     assert!(stdout.contains("recipient drift"), "stdout: {stdout}");
 
-    // A drift that removes a recipient announces the coming rotation.
+    // A drift that removes a recipient announces the coming rotation; this
+    // one also adds, so both authorization commands are named.
     fixture.write_manifest_with_recipients(&[("secret.env", "dotenv")], &[second.as_str()]);
     let (_, stdout) = status_line(&fixture);
+    assert!(stdout.contains("add 1"), "stdout: {stdout}");
     assert!(stdout.contains("remove 1"), "stdout: {stdout}");
+    assert!(
+        stdout.contains("gitveil recipient add and gitveil recipient remove"),
+        "stdout: {stdout}"
+    );
     assert!(
         stdout.contains("rotates the file data key"),
         "stdout: {stdout}"

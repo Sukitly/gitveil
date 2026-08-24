@@ -119,14 +119,14 @@ impl fmt::Display for PairStatus {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(formatter, "{}", self.data)?;
         if let RecipientStatus::Drift { policy, diff } = &self.recipients {
-            // Announce what the coming seal will do by consuming the same
-            // decision seal executes, not by re-deriving it.
-            let action = match diff.action() {
-                crate::recipient::RecipientAction::Rotate => {
-                    "run gitveil seal (rotates the file data key)"
-                }
-                crate::recipient::RecipientAction::Aligned
-                | crate::recipient::RecipientAction::Rewrap => "run gitveil seal",
+            // Data commands fail closed on drift; only the authorization
+            // commands converge it, and a removal rotates the data key.
+            let action = if diff.removed > 0 && diff.added > 0 {
+                "run gitveil recipient add and gitveil recipient remove (removal rotates the file data key)"
+            } else if diff.removed > 0 {
+                "run gitveil recipient remove (rotates the file data key)"
+            } else {
+                "run gitveil recipient add"
             };
             write!(
                 formatter,

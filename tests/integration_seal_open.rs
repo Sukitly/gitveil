@@ -271,189 +271,53 @@ fn repository_sops_config_is_ignored_even_when_it_is_invalid() {
 }
 
 #[test]
-fn seal_rewraps_recipient_additions_without_changing_encrypted_data_leaves() {
+fn seal_fails_closed_on_recipient_drift_in_both_directions() {
     let fixture = GitFixture::new();
     fixture.initialize();
     write(&fixture, "secret.env", "A=one\nB=stable\n");
     assert_success(fixture.run_gitveil(&["seal"]), "initial seal");
-    let original = read(&fixture, "secret.env.gitveil");
-    let original_a = encrypted_leaf(&original, "A");
-    let original_b = encrypted_leaf(&original, "B");
-    let original_layout = encrypted_leaf(&original, "layout");
+    let ciphertext = read(&fixture, "secret.env.gitveil");
+    let plaintext = read(&fixture, "secret.env");
+    let state = state_snapshot(&fixture);
 
     let second = fixture.add_identity();
     let first = fixture.recipient().to_owned();
-    fixture.write_manifest_with_recipients(
-        &[("secret.env", "dotenv")],
-        &[first.as_str(), second.as_str()],
-    );
-    let rewrapped = assert_success(fixture.run_gitveil(&["seal"]), "add recipient");
-    let stdout = String::from_utf8_lossy(&rewrapped.stdout);
-    assert!(stdout.contains("sealed"));
-    assert!(
-        !stdout.contains("data key rotated"),
-        "additions must not rotate the data key"
-    );
-    let with_two = read(&fixture, "secret.env.gitveil");
-    let envelope = CiphertextEnvelope::parse(&with_two, SourceFormat::Dotenv)
-        .expect("valid rewrapped envelope");
-    assert_eq!(envelope.age_recipients().len(), 2);
-    assert_eq!(encrypted_leaf(&with_two, "A"), original_a);
-    assert_eq!(encrypted_leaf(&with_two, "B"), original_b);
-    assert_eq!(encrypted_leaf(&with_two, "layout"), original_layout);
-
-    let unchanged = assert_success(fixture.run_gitveil(&["seal"]), "idempotent after rewrap");
-    assert!(String::from_utf8_lossy(&unchanged.stdout).contains("unchanged"));
-    assert_eq!(read(&fixture, "secret.env.gitveil"), with_two);
-}
-
-// A pure removal with unchanged content must still rotate; the seal must not
-// degrade into the byte-idempotent unchanged path.
-#[test]
-fn seal_rotates_the_data_key_on_a_pure_removal_without_content_changes() {
-    let fixture = GitFixture::new();
-    fixture.initialize();
-    write(&fixture, "secret.env", "A=one\nB=two\n");
-    assert_success(fixture.run_gitveil(&["seal"]), "initial seal");
-
-    let removed_only = tempfile::tempdir().expect("removed identity directory");
-    let removed_identity = removed_only.path().join("removed.txt");
-    fs::copy(fixture.identity(), &removed_identity).expect("snapshot first identity");
-
-    let (second, second_identity) = fixture.add_identity_with_path();
-    let first = fixture.recipient().to_owned();
-    fixture.write_manifest_with_recipients(
-        &[("secret.env", "dotenv")],
-        &[first.as_str(), second.as_str()],
-    );
-    assert_success(fixture.run_gitveil(&["seal"]), "add second recipient");
-    let before_removal = read(&fixture, "secret.env.gitveil");
-
-    // Remove the first recipient; the plaintext is untouched.
-    fixture.write_manifest_with_recipients(&[("secret.env", "dotenv")], &[second.as_str()]);
-    let sealed = assert_success(fixture.run_gitveil(&["seal"]), "pure removal");
-    let stdout = String::from_utf8_lossy(&sealed.stdout);
-    assert!(
-        stdout.contains("data key rotated"),
-        "a pure removal must rotate: {stdout}"
-    );
-    assert!(
-        !stdout.contains("unchanged"),
-        "a pure removal must not report the idempotent path: {stdout}"
-    );
-
-    let rotated = read(&fixture, "secret.env.gitveil");
-    let envelope =
-        CiphertextEnvelope::parse(&rotated, SourceFormat::Dotenv).expect("rotated envelope");
-    assert_eq!(
-        envelope.age_recipients(),
-        &[AgeRecipient::new(&second).expect("recipient")]
-    );
-    for leaf in ["A", "B", "layout"] {
-        assert_ne!(
-            encrypted_leaf(&rotated, leaf),
-            encrypted_leaf(&before_removal, leaf),
-            "leaf {leaf} must be re-encrypted under the fresh data key"
+    for recipients in [
+        vec![first.as_str(), second.as_str()], // addition direction
+        vec![second.as_str()],                 // removal direction
+    ] {
+        fixture.write_manifest_with_recipients(&[("secret.env", "dotenv")], &recipients);
+        let output = fixture.run_gitveil(&["seal"]);
+        assert_eq!(output.status.code(), Some(1), "seal must fail closed");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("recipient set differs from policy team"),
+            "stderr: {stderr}"
         );
+        assert!(
+            stderr.contains("gitveil recipient"),
+            "the error must point to the authorization command: {stderr}"
+        );
+        assert_eq!(read(&fixture, "secret.env.gitveil"), ciphertext);
+        assert_eq!(read(&fixture, "secret.env"), plaintext);
+        assert_eq!(state_snapshot(&fixture), state);
     }
 
-    let mut kept: Command = fixture.command_without_identity(fixture.binary());
-    kept.env("SOPS_AGE_KEY_FILE", &second_identity).arg("open");
-    assert_success(command_output(&mut kept), "open with the kept identity");
-    let mut excluded: Command = fixture.command_without_identity(fixture.binary());
-    excluded
-        .env("SOPS_AGE_KEY_FILE", &removed_identity)
-        .arg("open");
-    assert_eq!(
-        command_output(&mut excluded).status.code(),
-        Some(1),
-        "the removed identity must not decrypt the rotated envelope"
-    );
-}
-
-// Removing a recipient rotates the data key in the same seal that applies
-// pending edits, and the removed identity really loses access to the
-// new envelope. The exclusion assertion runs the product binary with the
-// removed identity only.
-#[test]
-fn seal_rotates_the_data_key_when_a_recipient_is_removed() {
-    let fixture = GitFixture::new();
-    fixture.initialize();
-    write(&fixture, "secret.env", "A=one\nB=stable\n");
-    assert_success(fixture.run_gitveil(&["seal"]), "initial seal");
-
-    // Snapshot the first identity alone before the fixture key file gains the
-    // second identity.
-    let removed_only = tempfile::tempdir().expect("removed identity directory");
-    let removed_identity = removed_only.path().join("removed.txt");
-    fs::copy(fixture.identity(), &removed_identity).expect("snapshot first identity");
-
-    let (second, second_identity) = fixture.add_identity_with_path();
-    let first = fixture.recipient().to_owned();
-    fixture.write_manifest_with_recipients(
-        &[("secret.env", "dotenv")],
-        &[first.as_str(), second.as_str()],
-    );
-    assert_success(fixture.run_gitveil(&["seal"]), "add second recipient");
-    let before_removal = read(&fixture, "secret.env.gitveil");
-
-    // Remove the first recipient and edit a value in the same seal.
-    write(
-        &fixture,
-        "secret.env",
-        &format!("A={CANARY}-post-removal\nB=stable\n"),
-    );
-    fixture.write_manifest_with_recipients(&[("secret.env", "dotenv")], &[second.as_str()]);
-    let sealed = assert_success(fixture.run_gitveil(&["seal"]), "remove recipient");
+    // The refusal is keyless: it fires identically without any identity.
+    let mut keyless: Command = fixture.command_without_identity(fixture.binary());
+    keyless.arg("seal");
+    let output = command_output(&mut keyless);
+    assert_eq!(output.status.code(), Some(1));
     assert!(
-        String::from_utf8_lossy(&sealed.stdout).contains("data key rotated"),
-        "rotation must be reported"
+        String::from_utf8_lossy(&output.stderr).contains("recipient set differs"),
+        "the drift refusal must not require an identity"
     );
-
-    let rotated = read(&fixture, "secret.env.gitveil");
-    let envelope =
-        CiphertextEnvelope::parse(&rotated, SourceFormat::Dotenv).expect("rotated envelope");
-    assert_eq!(
-        envelope.age_recipients(),
-        &[AgeRecipient::new(&second).expect("recipient")]
-    );
-    // A fresh data key re-encrypts every leaf, including untouched ones.
-    assert_ne!(
-        encrypted_leaf(&rotated, "B"),
-        encrypted_leaf(&before_removal, "B")
-    );
-    assert_ne!(
-        encrypted_leaf(&rotated, "layout"),
-        encrypted_leaf(&before_removal, "layout")
-    );
-
-    // A completed rotation is idempotent.
-    let unchanged = assert_success(fixture.run_gitveil(&["seal"]), "idempotent after rotation");
-    assert!(String::from_utf8_lossy(&unchanged.stdout).contains("unchanged"));
-    assert_eq!(read(&fixture, "secret.env.gitveil"), rotated);
-
-    // The kept identity still decrypts.
-    let mut kept: Command = fixture.command_without_identity(fixture.binary());
-    kept.env("SOPS_AGE_KEY_FILE", &second_identity).arg("open");
-    assert_success(command_output(&mut kept), "open with the kept identity");
-
-    // The removed identity is excluded from the rotated envelope.
-    let mut excluded: Command = fixture.command_without_identity(fixture.binary());
-    excluded
-        .env("SOPS_AGE_KEY_FILE", &removed_identity)
-        .arg("open");
-    let output = command_output(&mut excluded);
-    assert_eq!(
-        output.status.code(),
-        Some(1),
-        "the removed identity must not decrypt the rotated envelope"
-    );
-    assert!(!contains(&output.stdout, CANARY.as_bytes()));
-    assert!(!contains(&output.stderr, CANARY.as_bytes()));
 }
 
+// A pending content edit must not ride around the drift refusal; after the
+// explicit authorization converges the drift, the same seal succeeds.
 #[test]
-fn content_edit_and_recipient_drift_commit_as_one_verified_ciphertext() {
+fn content_edits_do_not_bypass_the_recipient_drift_refusal() {
     let fixture = GitFixture::new();
     fixture.initialize();
     write(&fixture, "secret.env", "A=one\nB=stable\n");
@@ -467,19 +331,74 @@ fn content_edit_and_recipient_drift_commit_as_one_verified_ciphertext() {
         &[first.as_str(), second.as_str()],
     );
     write(&fixture, "secret.env", "A=changed\nB=stable\n");
-    assert_success(fixture.run_gitveil(&["seal"]), "edit and rewrap");
+    let refused = fixture.run_gitveil(&["seal"]);
+    assert_eq!(refused.status.code(), Some(1));
+    assert_eq!(read(&fixture, "secret.env.gitveil"), before);
+    assert_eq!(read(&fixture, "secret.env"), b"A=changed\nB=stable\n");
 
+    assert_success(
+        fixture.run_gitveil(&["recipient", "add", second.as_str()]),
+        "authorize the addition explicitly",
+    );
+    assert_success(fixture.run_gitveil(&["seal"]), "seal after convergence");
     let after = read(&fixture, "secret.env.gitveil");
     assert_ne!(encrypted_leaf(&after, "A"), encrypted_leaf(&before, "A"));
     assert_eq!(encrypted_leaf(&after, "B"), encrypted_leaf(&before, "B"));
-    assert_eq!(
-        encrypted_leaf(&after, "layout"),
-        encrypted_leaf(&before, "layout")
-    );
     let envelope = CiphertextEnvelope::parse(&after, SourceFormat::Dotenv).expect("valid envelope");
     assert_eq!(envelope.age_recipients().len(), 2);
 }
 
+// A first seal has no envelope to anchor authorization, so the policy's
+// other existing ciphertexts are the anchor: drift there blocks encrypting
+// new files until the authorization command converges it.
+#[test]
+fn first_seal_requires_aligned_policy_siblings() {
+    let fixture = GitFixture::new();
+    fixture.initialize();
+    write(&fixture, "secret.env", "A=one\n");
+    assert_success(fixture.run_gitveil(&["seal"]), "seal the existing file");
+
+    let second = fixture.add_identity();
+    let first = fixture.recipient().to_owned();
+    fixture.write_manifest_with_recipients(
+        &[("secret.env", "dotenv"), ("fresh.env", "dotenv")],
+        &[first.as_str(), second.as_str()],
+    );
+    write(&fixture, "fresh.env", "B=two\n");
+
+    let refused = fixture.run_gitveil(&["seal", "fresh.env"]);
+    assert_eq!(
+        refused.status.code(),
+        Some(1),
+        "first seal must fail closed"
+    );
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(
+        stderr.contains("drifted ciphertext at secret.env.gitveil"),
+        "stderr: {stderr}"
+    );
+    assert!(
+        !fixture.root().join("fresh.env.gitveil").exists(),
+        "no ciphertext may be created under a drifted policy"
+    );
+
+    assert_success(
+        fixture.run_gitveil(&["recipient", "add", second.as_str()]),
+        "converge the policy",
+    );
+    assert_success(
+        fixture.run_gitveil(&["seal", "fresh.env"]),
+        "first seal after convergence",
+    );
+    let envelope =
+        CiphertextEnvelope::parse(&read(&fixture, "fresh.env.gitveil"), SourceFormat::Dotenv)
+            .expect("valid envelope");
+    assert_eq!(envelope.age_recipients().len(), 2);
+}
+
+// An aligned seal still requires an identity to decrypt its incremental
+// baseline; without one it fails and leaves plaintext, ciphertext, and
+// baseline state untouched.
 #[test]
 fn seal_without_any_envelope_identity_leaves_all_three_files_unchanged() {
     let fixture = GitFixture::new();
@@ -489,22 +408,20 @@ fn seal_without_any_envelope_identity_leaves_all_three_files_unchanged() {
     let ciphertext = read(&fixture, "secret.env.gitveil");
     let state = state_snapshot(&fixture);
 
-    let second = fixture.add_identity();
-    let first = fixture.recipient().to_owned();
-    // Both drift directions require decrypting the existing ciphertext first
-    // (rewrap and rotation alike), so both fail closed without an identity.
-    for recipients in [
-        vec![first.as_str(), second.as_str()], // addition: rewrap direction
-        vec![second.as_str()],                 // removal: rotation direction
-    ] {
-        fixture.write_manifest_with_recipients(&[("secret.env", "dotenv")], &recipients);
-        let mut command: Command = fixture.command_without_identity(fixture.binary());
-        command.arg("seal");
-        let output = support::command_output(&mut command);
-        assert_eq!(output.status.code(), Some(1));
-        assert_eq!(read(&fixture, "secret.env.gitveil"), ciphertext);
-        assert_eq!(state_snapshot(&fixture), state);
-    }
+    // The manifest stays aligned with the envelope: only the identity is
+    // missing, and only the plaintext has a pending edit.
+    write(&fixture, "secret.env", "A=edited\n");
+    let mut command: Command = fixture.command_without_identity(fixture.binary());
+    command.arg("seal");
+    let output = support::command_output(&mut command);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        !String::from_utf8_lossy(&output.stderr).contains("recipient set differs"),
+        "an aligned seal must fail on the identity, not on drift"
+    );
+    assert_eq!(read(&fixture, "secret.env.gitveil"), ciphertext);
+    assert_eq!(read(&fixture, "secret.env"), b"A=edited\n");
+    assert_eq!(state_snapshot(&fixture), state);
 }
 
 #[test]
