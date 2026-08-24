@@ -308,3 +308,58 @@ pub(crate) fn sync_directory(directory: &Path) -> Result<()> {
             )
         })
 }
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+
+    use crate::error::ErrorCategory;
+
+    use super::{load_manifest, publish_if_fresh};
+
+    const RECIPIENT: &str = "age1qyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqs3290gq";
+
+    fn manifest_bytes(policy: &str) -> Vec<u8> {
+        format!(
+            r#"{{
+              "version": 1,
+              "recipientPolicies": {{ "{policy}": {{ "age": ["{RECIPIENT}"] }} }},
+              "files": []
+            }}"#
+        )
+        .into_bytes()
+    }
+
+    #[test]
+    fn publication_refuses_a_concurrently_changed_manifest_and_preserves_it() {
+        let root = tempfile::tempdir().expect("repository root");
+        fs::write(root.path().join(".gitveilrc.json"), manifest_bytes("team"))
+            .expect("write manifest");
+        let (preparation, _) = load_manifest(root.path()).expect("load manifest");
+
+        // A concurrent writer replaces the document after it was loaded.
+        let concurrent = manifest_bytes("other");
+        fs::write(root.path().join(".gitveilrc.json"), &concurrent).expect("concurrent write");
+
+        let error = publish_if_fresh(root.path(), &preparation, b"candidate", "gitveil recipient")
+            .expect_err("stale publication must be refused");
+        assert_eq!(error.category(), ErrorCategory::Concurrency);
+        assert_eq!(
+            fs::read(root.path().join(".gitveilrc.json")).expect("manifest"),
+            concurrent,
+            "the concurrent write must be preserved"
+        );
+
+        // With a fresh document the same candidate publishes.
+        fs::write(root.path().join(".gitveilrc.json"), manifest_bytes("team"))
+            .expect("restore manifest");
+        let (preparation, _) = load_manifest(root.path()).expect("reload manifest");
+        publish_if_fresh(
+            root.path(),
+            &preparation,
+            &manifest_bytes("team"),
+            "gitveil recipient",
+        )
+        .expect("fresh publication succeeds");
+    }
+}

@@ -669,3 +669,162 @@ fn recipient_add_converges_multiple_files_and_predeclared_entries() {
     );
     assert_eq!(recipients_of(&fixture, "pending.env.gitveil").len(), 2);
 }
+
+/// Writes a two-policy manifest: `team` guards `secret.env`, `ops` guards
+/// `ops.env`.
+fn write_two_policy_manifest(fixture: &GitFixture, team: &[&str], ops: &[&str]) {
+    let manifest = serde_json::json!({
+        "version": 1,
+        "recipientPolicies": {
+            "team": { "age": team },
+            "ops": { "age": ops }
+        },
+        "files": [
+            { "path": "secret.env", "format": "dotenv", "recipientPolicy": "team" },
+            { "path": "ops.env", "format": "dotenv", "recipientPolicy": "ops" }
+        ]
+    });
+    fs::write(
+        fixture.root().join(".gitveilrc.json"),
+        serde_json::to_vec_pretty(&manifest).expect("serialize manifest"),
+    )
+    .expect("write manifest");
+}
+
+// An authorization command touches exactly the selected policy: files under
+// other policies keep their bytes, and with several policies the selector
+// is mandatory.
+#[test]
+fn recipient_commands_are_scoped_to_the_selected_policy() {
+    let fixture = GitFixture::new();
+    fixture.initialize();
+    let first = fixture.recipient().to_owned();
+    let (ops_member, _) = fixture.add_identity_with_path();
+    write_two_policy_manifest(&fixture, &[first.as_str()], &[ops_member.as_str()]);
+    write(&fixture, "secret.env", "A=one\n");
+    write(&fixture, "ops.env", "B=two\n");
+    assert_success(fixture.run_gitveil(&["seal"]), "seal both policies");
+    let ops_cipher = read(&fixture, "ops.env.gitveil");
+
+    // Several policies: the selector is required.
+    let (third, _) = fixture.add_identity_with_path();
+    let output = fixture.run_gitveil(&["recipient", "add", third.as_str()]);
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("pass --policy"),
+        "the selector requirement must be explained: {stderr}"
+    );
+    assert_eq!(read(&fixture, "ops.env.gitveil"), ops_cipher);
+
+    // The explicit selector converges only the selected policy's files.
+    let added = assert_success(
+        fixture.run_gitveil(&["recipient", "add", "--policy", "team", third.as_str()]),
+        "recipient add scoped to team",
+    );
+    let stdout = String::from_utf8_lossy(&added.stdout);
+    assert!(stdout.contains("secret.env: rewrapped"), "stdout: {stdout}");
+    assert!(
+        !stdout.contains("ops.env"),
+        "the other policy's file must not appear: {stdout}"
+    );
+    assert_eq!(
+        read(&fixture, "ops.env.gitveil"),
+        ops_cipher,
+        "the other policy's ciphertext must keep its bytes"
+    );
+    assert_eq!(recipients_of(&fixture, "secret.env.gitveil").len(), 2);
+    assert_eq!(
+        recipients_of(&fixture, "ops.env.gitveil"),
+        vec![ops_member.clone()]
+    );
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&read(&fixture, ".gitveilrc.json")).expect("manifest JSON");
+    assert_eq!(
+        manifest["recipientPolicies"]["ops"]["age"],
+        serde_json::json!([ops_member]),
+        "the other policy must be untouched"
+    );
+    assert_success(fixture.run_gitveil(&["seal"]), "seal after scoped add");
+}
+
+// A ciphertext that cannot be parsed is reported per file while the rest of
+// the policy converges; repairing it and rerunning converges the leftover.
+#[test]
+fn a_broken_ciphertext_is_reported_per_file_while_others_converge() {
+    let fixture = GitFixture::new();
+    fixture.initialize();
+    fixture.write_manifest_with_recipients(
+        &[("secret.env", "dotenv"), ("other.env", "dotenv")],
+        &[fixture.recipient()],
+    );
+    write(&fixture, "secret.env", "A=one\n");
+    write(&fixture, "other.env", "B=two\n");
+    assert_success(fixture.run_gitveil(&["seal"]), "initial seal");
+    let intact = read(&fixture, "other.env.gitveil");
+    write(&fixture, "other.env.gitveil", "not an envelope\n");
+
+    let (second, _) = fixture.add_identity_with_path();
+    let output = fixture.run_gitveil(&["recipient", "add", second.as_str()]);
+    assert_eq!(output.status.code(), Some(1), "the broken file must fail");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stdout.contains("secret.env: rewrapped"), "stdout: {stdout}");
+    assert!(
+        stderr.contains("other.env"),
+        "the broken file must be reported: {stderr}"
+    );
+    assert!(
+        stderr.contains("not fully effective"),
+        "the partial convergence must be called out: {stderr}"
+    );
+    assert_eq!(recipients_of(&fixture, "secret.env.gitveil").len(), 2);
+    let mut expected = vec![fixture.recipient().to_owned(), second.clone()];
+    expected.sort_unstable();
+    assert_eq!(manifest_recipients(&fixture), expected);
+
+    // Repairing the ciphertext and rerunning converges the leftover drift.
+    fs::write(fixture.root().join("other.env.gitveil"), &intact).expect("repair ciphertext");
+    let rerun = assert_success(
+        fixture.run_gitveil(&["recipient", "add", second.as_str()]),
+        "converging rerun",
+    );
+    let stdout = String::from_utf8_lossy(&rerun.stdout);
+    assert!(stdout.contains("other.env: rewrapped"), "stdout: {stdout}");
+    assert!(
+        stdout.contains("secret.env: no change needed"),
+        "stdout: {stdout}"
+    );
+    assert_eq!(recipients_of(&fixture, "other.env.gitveil").len(), 2);
+    assert_success(fixture.run_gitveil(&["seal"]), "seal after repair");
+}
+
+// Removing the only recipient an envelope carries is refused even when the
+// policy itself keeps other members: someone must be granted first.
+#[test]
+fn removing_an_envelopes_last_recipient_is_refused_with_zero_side_effects() {
+    let fixture = GitFixture::new();
+    fixture.initialize();
+    write(&fixture, "secret.env", "A=one\n");
+    assert_success(fixture.run_gitveil(&["seal"]), "initial seal");
+    let ciphertext = read(&fixture, "secret.env.gitveil");
+
+    // The manifest gained another member without envelope convergence
+    // (hand edit); the envelope still carries only the first recipient.
+    let injected = foreign_recipient();
+    let first = fixture.recipient().to_owned();
+    fixture.write_manifest_with_recipients(
+        &[("secret.env", "dotenv")],
+        &[injected.as_str(), first.as_str()],
+    );
+    let manifest = read(&fixture, ".gitveilrc.json");
+
+    let output = fixture.run_gitveil(&["recipient", "remove", first.as_str()]);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("no recipient able to decrypt"),
+        "the emptied-envelope refusal must be explained"
+    );
+    assert_eq!(read(&fixture, "secret.env.gitveil"), ciphertext);
+    assert_eq!(read(&fixture, ".gitveilrc.json"), manifest);
+}

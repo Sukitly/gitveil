@@ -248,6 +248,65 @@ fn resolve_narrows_to_the_policy_intersection_and_excludes_removed_recipients() 
     );
 }
 
+// Mixed drift at resolve: the removal direction narrows under a fresh data
+// key while the pending addition is reported for gitveil recipient add.
+#[test]
+fn resolve_narrows_and_reports_the_pending_addition_together() {
+    let (fixture, second, second_identity, removed_identity) = conflicted_two_recipient_fixture();
+
+    // The pulled policy removed the first recipient and added a new one the
+    // envelopes never carried.
+    let pending = fixture.add_identity();
+    fixture.write_manifest_with_recipients(
+        &[("secret.env", "dotenv")],
+        &[second.as_str(), pending.as_str()],
+    );
+
+    let resolved = fixture.run_gitveil(&["resolve"]);
+    assert_eq!(
+        resolved.status.code(),
+        Some(1),
+        "the pending addition keeps the outcome at attention"
+    );
+    let stdout = String::from_utf8_lossy(&resolved.stdout);
+    assert!(stdout.contains("data key rotated"), "stdout: {stdout}");
+    assert!(
+        stdout.contains("recipient drift remains"),
+        "stdout: {stdout}"
+    );
+    assert_eq!(read(&fixture, "secret.env"), b"A=ours\nB=theirs\n");
+    let envelope =
+        CiphertextEnvelope::parse(&read(&fixture, "secret.env.gitveil"), SourceFormat::Dotenv)
+            .expect("merged envelope");
+    assert_eq!(
+        envelope.age_recipients(),
+        &[AgeRecipient::new(&second).expect("recipient")],
+        "the merged envelope carries exactly the intersection"
+    );
+
+    // The removed identity is excluded; the kept identity converges the
+    // pending addition afterwards.
+    let mut excluded = fixture.command_without_identity(fixture.binary());
+    excluded
+        .env("SOPS_AGE_KEY_FILE", &removed_identity)
+        .arg("open");
+    assert_eq!(command_output(&mut excluded).status.code(), Some(1));
+    let mut converge = fixture.command_without_identity(fixture.binary());
+    converge.env("SOPS_AGE_KEY_FILE", &second_identity).args([
+        "recipient",
+        "add",
+        pending.as_str(),
+    ]);
+    assert_success(
+        command_output(&mut converge),
+        "converge the pending addition",
+    );
+    let envelope =
+        CiphertextEnvelope::parse(&read(&fixture, "secret.env.gitveil"), SourceFormat::Dotenv)
+            .expect("converged envelope");
+    assert_eq!(envelope.age_recipients().len(), 2);
+}
+
 // A policy with no recipient in common with the ours envelope cannot accept
 // merged content anywhere safely: resolve refuses with zero side effects.
 #[test]

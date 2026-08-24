@@ -89,7 +89,7 @@ pub(super) enum AuthorizationRejection {
     #[error("a policy must keep at least one recipient; this removal would empty it")]
     EmptyPolicy,
     #[error(
-        "removing these recipients would leave {0}.gitveil with no recipient able to decrypt; run gitveil recipient add first"
+        "removing these recipients would leave {0}.gitveil with no recipient able to decrypt; grant a replacement with gitveil recipient add before removing them"
     )]
     EmptiesEnvelope(ManagedPath),
 }
