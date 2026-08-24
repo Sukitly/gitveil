@@ -1,9 +1,7 @@
-#!/usr/bin/env python3
-"""Pinned official SOPS artifacts shared by tests, Docker, and release packaging."""
+"""Pinned official SOPS artifacts shared by tests and release packaging."""
 
 from __future__ import annotations
 
-import argparse
 from dataclasses import dataclass
 import hashlib
 from pathlib import Path
@@ -165,26 +163,3 @@ def fetch_verified(destination: Path, artifact: Artifact) -> Path:
         temporary.unlink(missing_ok=True)
         raise
     return destination
-
-
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--print-version",
-        action="store_true",
-        help="print the selected SOPS version instead of its artifact metadata",
-    )
-    parser.add_argument(
-        "--baseline",
-        action="store_true",
-        help="select the compatibility baseline instead of the pinned sidecar",
-    )
-    parser.add_argument("--system")
-    parser.add_argument("--machine")
-    arguments = parser.parse_args()
-    selected_version = COMPATIBILITY_BASELINE_VERSION if arguments.baseline else VERSION
-    if arguments.print_version:
-        print(selected_version)
-    else:
-        selected = artifact_for(arguments.system, arguments.machine, selected_version)
-        print(f"{selected.filename}\t{selected.sha256}")

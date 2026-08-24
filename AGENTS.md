@@ -18,7 +18,8 @@ Inspect the existing implementation and tests before proposing changes. Do not i
 - Gitveil is one Rust 2024 package with a library and a thin binary.
 - Supported production hosts are macOS and Linux.
 - The Rust version is pinned in `rust-toolchain.toml`.
-- Compatible SOPS and age-keygen builds and artifact checksums are declared in `scripts/sops_artifacts.py` and `scripts/age_artifacts.py`.
+- Compatible SOPS and age-keygen builds and artifact checksums are declared in `scripts/_lib/sops_artifacts.py` and `scripts/_lib/age_keygen_artifacts.py`.
+- Files directly under `scripts/` are executable entry points; import-only Python modules belong under `scripts/_lib/` and must not be executable.
 - `Cargo.toml` intentionally has `publish = false`; do not publish the crate or create releases unless explicitly requested.
 - Keep all tracked text, code comments, tests, commit messages, and pull request content in English.
 - Do not add private keys, plaintext secrets, local absolute paths, generated build output, unpublished planning material, or tool transcripts.
@@ -29,7 +30,7 @@ Inspect the existing implementation and tests before proposing changes. Do not i
 Keep pure policy and transformation code separate from external effects.
 
 - Pure domain modules and feature-local `plan` modules must not access the filesystem, processes, Git, SOPS, environment, network, clock, threads, or randomness.
-- `scripts/check-architecture.py` is the executable declaration of modules that belong to the functional core. Add new pure modules to that declaration rather than bypassing the check.
+- `scripts/check-functional-core.py` is the executable declaration of modules that belong to the functional core. Add new pure modules to that declaration rather than bypassing the check.
 - `src/source/` owns typed and lossless source parsing and rendering.
 - `src/semantic/` owns pure semantic diff and merge behavior.
 - `src/git/`, `src/sops/`, `src/age.rs`, and `src/runtime/` contain external adapters.
@@ -80,15 +81,13 @@ Match the test level to the contract:
 - Isolate `HOME`, global and system Git configuration, identity environment variables, and fixture state.
 - Every child process needs a deadline and must be killed and reaped after a timeout.
 
-Use targeted tests during development. The public gates are:
+Use targeted tests during development. Complete validation runs only in GitHub Actions:
 
-```bash
-./scripts/check-host.sh
-./scripts/check-linux.sh
-./scripts/check-all.sh
-```
+- `Core` runs platform-independent library unit tests, pure `contract_*` binaries, formatting, architecture and documentation checks, Clippy, and dependency policy once on Ubuntu.
+- `Linux` and `macOS` each run the complementary native host suite, release build, and package validation on a GitHub-hosted runner.
+- `.config/nextest.toml` is the executable test classification. New `tests/*.rs` binaries default to the host suite unless deliberately named `contract_*`; colocated unit tests must remain pure unless their adapter module is explicitly assigned to the host profile.
 
-`check-host.sh` is the native macOS/Linux gate. `check-linux.sh` runs the Linux suite in Docker. `check-all.sh` runs both and therefore must be invoked from macOS. GitHub Actions runs `check-host.sh` natively on Linux and macOS for pull requests and pushes to `main`.
+Do not recreate aggregate local quality-gate scripts or Docker replicas of GitHub-hosted runners. Local commands are for targeted Red/Green feedback; the pull request checks are the complete merge gates.
 
 Do not change test expectations merely to make a gate pass. Fix the implementation, fixture isolation, or contract.
 
@@ -97,7 +96,7 @@ Do not change test expectations merely to make a gate pass. Fix the implementati
 - Update `README.md` when commands, configuration, installation, security boundaries, or release layout change.
 - Update `docs/getting-started.md` when the first-use path changes.
 - Update `CONTRIBUTING.md` when contributor tooling or quality gates change.
-- Keep relative links in public Markdown valid; `scripts/check-docs.py` enforces them.
+- Keep relative links in public Markdown valid; `scripts/check-doc-links.py` enforces them.
 - Keep dependency changes intentional and locked. Explain why a new runtime dependency belongs at its architectural boundary.
 - Preserve third-party license files and notices in release archives.
 
@@ -108,7 +107,7 @@ Use English branch names, commits, pull request titles, and descriptions. Keep e
 - a pull request,
 - linear history through squash merging,
 - resolved review conversations,
-- successful `Linux` and `macOS` checks,
+- successful `Core`, `Linux`, and `macOS` checks,
 - a branch tested against the latest `main`.
 
 Before handing off a change, inspect the final diff, run `git diff --check`, confirm that no generated or secret-bearing files are tracked, and report the exact checks run and any checks that could not be run.

@@ -12,7 +12,12 @@ import subprocess
 import tarfile
 import tempfile
 
-from release_package import archive_root_name, build_archive, package_version, validate_archive
+from _lib.release_archive import (
+    archive_root_name,
+    build_archive,
+    package_version,
+    validate_archive,
+)
 
 _INSTALL_MEMBERS = (
     ("share/licenses/gitveil/LICENSE", 0o644),

@@ -7,7 +7,7 @@ import argparse
 from pathlib import Path
 import sys
 
-from age_artifacts import VERSION, artifact_for, fetch_verified
+from _lib.age_keygen_artifacts import VERSION, artifact_for, fetch_verified
 
 
 def main() -> int:

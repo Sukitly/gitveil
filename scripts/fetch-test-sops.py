@@ -12,7 +12,7 @@ from __future__ import annotations
 from pathlib import Path
 import sys
 
-from sops_artifacts import (
+from _lib.sops_artifacts import (
     COMPATIBILITY_BASELINE_VERSION,
     VERSION,
     artifact_for,

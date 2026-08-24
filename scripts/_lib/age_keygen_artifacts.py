@@ -1,9 +1,7 @@
-#!/usr/bin/env python3
 """Pinned official age-keygen artifacts shared by tests and release packaging."""
 
 from __future__ import annotations
 
-import argparse
 from dataclasses import dataclass
 import hashlib
 from pathlib import Path
@@ -191,16 +189,3 @@ def fetch_verified(destination: Path, artifact: Artifact) -> Path:
         extracted.unlink(missing_ok=True)
         raise
     return extracted
-
-
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--print-version", action="store_true")
-    parser.add_argument("--system")
-    parser.add_argument("--machine")
-    arguments = parser.parse_args()
-    if arguments.print_version:
-        print(VERSION)
-    else:
-        selected = artifact_for(arguments.system, arguments.machine)
-        print(f"{selected.filename}\t{selected.sha256}")

@@ -4,24 +4,14 @@ Gitveil handles secret-bearing files and Git history, so changes must preserve i
 
 ## Development environment
 
-Required tools:
+Required tools for source development:
 
 - macOS or Linux
 - Git 2.20+
 - Rust 1.98.0, selected automatically by `rust-toolchain.toml`
 - Python 3.9+
-- `cargo-nextest` 0.9.140
-- `cargo-deny`
-- Docker for the Linux quality gate
 
-Install the Cargo tools if they are not already available:
-
-```bash
-cargo install cargo-nextest --locked --version 0.9.140
-cargo install cargo-deny --locked
-```
-
-The test and packaging scripts download checksum-pinned SOPS and age artifacts into `target/` on first use. They do not modify system installations.
+GitHub Actions installs the pinned `cargo-nextest` and `cargo-deny` versions used by the complete merge gates. Artifact helpers download checksum-pinned SOPS and age builds for the current platform into `target/`; they do not modify system installations.
 
 ## Making changes
 
@@ -44,27 +34,24 @@ Preserve these invariants:
 
 ## Tests
 
-Run the host gate for the current platform:
+Use targeted commands for local Red/Green feedback. Fetch only the current platform's pinned sidecars when the selected test needs them:
 
 ```bash
-./scripts/check-host.sh
+./scripts/fetch-test-sops.py
+AGE_KEYGEN_BIN="$(./scripts/fetch-test-age-keygen.py)" \
+  cargo test --test integration_identity
+cargo test open::plan::tests::both_sides_changed_reports_a_conflict_and_keeps_local
 ```
 
-Run the native Linux suite in Docker:
+Complete validation runs only in GitHub Actions. `.config/nextest.toml` defines two complementary suites:
 
-```bash
-./scripts/check-linux.sh
-```
+| Check | Runner | Scope |
+|---|---|---|
+| `Core` | Ubuntu | Platform-independent unit and `contract_*` tests, formatting, architecture, documentation, Clippy, and dependency policy |
+| `Linux` | Ubuntu | Native CLI, Git, SOPS, identity, filesystem, runtime, release build, and package validation |
+| `macOS` | macOS | The same native host suite on macOS |
 
-On macOS, run both through the unified gate before requesting review:
-
-```bash
-./scripts/check-all.sh
-```
-
-The gates cover formatting, architecture boundaries, public documentation links, Clippy, unit and integration tests, dependency policy, release builds, and native archive validation. Integration tests use real Git and checksum-pinned SOPS and age-keygen executables. Initial cold runs download dependencies and build artifacts and may take substantially longer than warm runs.
-
-GitHub Actions runs `scripts/check-host.sh` natively on Linux and macOS for every pull request and push to `main`. CI uses no repository secrets and does not publish artifacts or releases.
+Every pull request and push to `main` runs all three checks on GitHub-hosted runners. CI uses no repository secrets and does not publish artifacts or releases. Do not add aggregate local gate scripts or a Docker replica of the hosted Linux runner.
 
 ## Pull requests
 
@@ -74,6 +61,6 @@ A pull request should:
 - Include tests for each changed postcondition and relevant failure path.
 - Update user documentation when installation, commands, output, configuration, security boundaries, or release layout changes.
 - Contain no private identity, plaintext secret, local absolute path, generated build output, or unrelated formatting churn.
-- Pass the applicable host and Linux quality gates.
+- Pass the required `Core`, `Linux`, and `macOS` GitHub Actions checks.
 
 By intentionally submitting a contribution for inclusion in Gitveil, you agree to license that contribution under the MIT License without additional terms or conditions.

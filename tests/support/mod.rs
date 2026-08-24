@@ -14,7 +14,7 @@ const PROCESS_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The SOPS build that wrote ciphertext already living in user repositories.
 ///
-/// Mirrors `COMPATIBILITY_BASELINE_VERSION` in `scripts/sops_artifacts.py`; the two
+/// Mirrors `COMPATIBILITY_BASELINE_VERSION` in `scripts/_lib/sops_artifacts.py`; the two
 /// are held in agreement by `baseline_binary_is_exactly_the_declared_baseline`, which
 /// executes the fetched binary rather than trusting either declaration.
 pub const SOPS_COMPATIBILITY_BASELINE: (u64, u64, u64) = (3, 13, 2);

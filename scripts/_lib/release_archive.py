@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Shared native release archive construction for Gitveil packaging and installation."""
 
 from __future__ import annotations
@@ -12,12 +11,12 @@ import subprocess
 import tarfile
 import tempfile
 
-from age_artifacts import VERSION as AGE_VERSION
-from age_artifacts import artifact_for as age_artifact_for
-from age_artifacts import fetch_verified as fetch_age_keygen
-from age_artifacts import verify_binary as verify_age_keygen
-from sops_artifacts import VERSION as SOPS_VERSION
-from sops_artifacts import artifact_for, fetch_verified, verify
+from .age_keygen_artifacts import VERSION as AGE_VERSION
+from .age_keygen_artifacts import artifact_for as age_artifact_for
+from .age_keygen_artifacts import fetch_verified as fetch_age_keygen
+from .age_keygen_artifacts import verify_binary as verify_age_keygen
+from .sops_artifacts import VERSION as SOPS_VERSION
+from .sops_artifacts import artifact_for, fetch_verified, verify
 
 
 def package_version(root: Path) -> str:
